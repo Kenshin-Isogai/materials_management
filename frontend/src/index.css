@@ -1,0 +1,37 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&family=Space+Grotesk:wght@400;500;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color: #1c1d1f;
+  background: radial-gradient(circle at 15% 10%, #f3d6b4 0%, transparent 42%),
+    radial-gradient(circle at 85% 90%, #b4e2d2 0%, transparent 34%), #f4f2eb;
+}
+
+body {
+  margin: 0;
+  font-family: "IBM Plex Sans JP", sans-serif;
+  min-height: 100vh;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.panel {
+  @apply rounded-2xl border border-black/5 bg-white/80 backdrop-blur-md shadow-panel;
+}
+
+.input {
+  @apply w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-ink outline-none transition focus:border-signal focus:ring-2 focus:ring-signal/20;
+}
+
+.button {
+  @apply inline-flex items-center justify-center rounded-xl border border-slate-700 bg-slatebrand px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60;
+}
+
+.button-subtle {
+  @apply inline-flex items-center justify-center rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50;
+}

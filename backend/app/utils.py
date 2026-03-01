@@ -1,0 +1,70 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timezone, timedelta
+import re
+import sqlite3
+
+from .errors import AppError
+
+JST = timezone(timedelta(hours=9))
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def now_jst_iso() -> str:
+    return datetime.now(JST).replace(microsecond=0).isoformat()
+
+
+def today_jst() -> str:
+    return datetime.now(JST).date().isoformat()
+
+
+def normalize_optional_date(value: str | None, field_name: str) -> str | None:
+    if value is None:
+        return None
+    stripped = str(value).strip()
+    if stripped == "":
+        return None
+    if DATE_PATTERN.match(stripped):
+        return stripped
+    try:
+        parsed = datetime.fromisoformat(stripped)
+        return parsed.date().isoformat()
+    except ValueError:
+        pass
+    try:
+        parsed = date.fromisoformat(stripped)
+        return parsed.isoformat()
+    except ValueError as exc:
+        raise AppError(
+            code="INVALID_DATE",
+            message=f"{field_name} must be YYYY-MM-DD",
+            status_code=422,
+        ) from exc
+
+
+def require_positive_int(value: int, field_name: str) -> int:
+    if int(value) <= 0:
+        raise AppError(
+            code="INVALID_QUANTITY",
+            message=f"{field_name} must be > 0",
+            status_code=422,
+        )
+    return int(value)
+
+
+def require_non_empty(value: str, field_name: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise AppError(
+            code="INVALID_FIELD",
+            message=f"{field_name} must not be empty",
+            status_code=422,
+        )
+    return normalized
+
+
+def to_dict(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    return {key: row[key] for key in row.keys()}
+

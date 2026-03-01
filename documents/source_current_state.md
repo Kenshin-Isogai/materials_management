@@ -1,0 +1,94 @@
+# Source Current State
+
+Last updated: 2026-03-01 (JST)
+
+## 1. System Snapshot
+
+- Project type: local-first optical component inventory management application.
+- Stack:
+  - Backend: Python + FastAPI + SQLite
+  - Frontend: React + TypeScript + Vite + SWR
+- Runtime posture:
+  - Current: personal/local usage
+  - Direction: PoC designed to remain compatible with future multi-user/RBAC expansion
+
+## 2. Repository Structure (active areas)
+
+- `backend/`
+  - `main.py`: CLI entrypoint and command routing
+  - `app/api.py`: HTTP API routes (73 endpoints)
+  - `app/service.py`: domain logic (single business logic layer)
+  - `app/db.py`: schema + indexes + migration logic (17 tables)
+  - `tests/`: integration/service/path tests
+- `frontend/`
+  - `src/pages/`: tab/page UI for dashboard, items, inventory, orders, reservations, assemblies, projects, BOM, locations, snapshot, history, master data
+  - `src/lib/api.ts`: API client with fallback API base probing
+- `documents/`
+  - `technical_documentation.md`
+  - `team_onboarding.md`
+  - `source_current_state.md` (this file)
+  - `change_log.md`
+
+## 3. Backend State
+
+### 3.1 API and Domain
+
+- API wrapper uses common response envelope:
+  - success: `status=ok`
+  - error: `status=error` with code/message/details
+- Business rules are centralized in `backend/app/service.py` and shared by API and CLI.
+- Current auth posture:
+  - no enforced auth for PoC
+  - capability metadata endpoint exists: `GET /api/auth/capabilities`
+  - auth mode read from `INVENTORY_AUTH_MODE` (`none`, `rbac_dry_run`, `rbac_enforced`)
+
+### 3.2 Data Model
+
+- SQLite with normalized core entities:
+  - items, inventory ledger, orders/quotations, reservations
+  - assemblies/projects with requirements
+  - supplier item aliases and category aliases
+  - import jobs/effects for reversible item imports
+  - transaction log with undo chain
+- Referential integrity and checks are enforced with foreign keys, constraints, indexes, and order validation triggers.
+
+### 3.3 Reservation Behavior
+
+- Reservation release/consume now supports:
+  - full action (status transition to `RELEASED` / `CONSUMED`)
+  - partial action (status remains `ACTIVE`, reservation quantity decreases)
+- API endpoints accept optional body quantity for partial operations:
+  - `POST /api/reservations/{id}/release`
+  - `POST /api/reservations/{id}/consume`
+- CLI supports partial quantity flags:
+  - `release-reservation --reservation-id <id> --quantity <n>`
+  - `consume-reservation --reservation-id <id> --quantity <n>`
+
+## 4. Frontend State
+
+- SPA navigation is implemented with React Router via `AppShell`.
+- Data fetching is SWR-based with typed API client wrappers.
+- Reservations page supports partial release/consume via quantity prompt.
+- Build system: `npm run build` (Vite production build + TypeScript build).
+
+## 5. File and Import Workflow State
+
+- Canonical quotation folder layout is active:
+  - `quotations/unregistered/csv_files/<supplier>/`
+  - `quotations/unregistered/pdf_files/<supplier>/`
+  - `quotations/registered/csv_files/<supplier>/`
+  - `quotations/registered/pdf_files/<supplier>/`
+- Batch import functions normalize legacy/typo paths, move files safely, and emit warnings for unresolved paths.
+- Collision-safe file move behavior is implemented (`_1`, `_2`, ... suffixing).
+
+## 6. Quality State
+
+- Backend tests: `33 passed` (latest run on 2026-03-01).
+- Frontend production build: success (latest run on 2026-03-01).
+
+## 7. Known Directional Gaps (intentional for current phase)
+
+- Auth/RBAC enforcement is not active yet (capability scaffolding only).
+- Multi-user concurrency hardening beyond current SQLite/local posture is not implemented.
+- Hash-based quotation duplicate detection and strict provenance metadata are planned, not yet implemented.
+- Compliance controls (retention/backup policy enforcement) are not yet implemented.
