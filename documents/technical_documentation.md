@@ -356,3 +356,11 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 3. Expose endpoints/CLI routes in `app/api.py` and `main.py`.
 4. Update frontend API usage/types in `frontend/src/lib`.
 5. Add or update tests in `backend/tests`.
+
+### Order/quotation correction operations (UI + consistency)
+
+- Correction endpoints:
+  - `PUT /api/quotations/{quotation_id}` updates quotation metadata.
+  - `DELETE /api/orders/{order_id}` deletes open (non-arrived) orders.
+  - `DELETE /api/quotations/{quotation_id}` deletes quotation and linked orders.
+- Consistency rule: when these operations mutate DB rows, matching order CSV records are rewritten/removed so CSV source files and database state do not diverge.

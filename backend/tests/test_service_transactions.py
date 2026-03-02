@@ -904,3 +904,77 @@ def test_import_unregistered_orders_keeps_per_file_missing_csv_when_batch_regist
 
     temp_register = unregistered_root / "missing_item_registers" / "SupplierFail__Q-FAIL-MISSING_missing_items_registration.csv"
     assert temp_register.exists()
+
+
+def test_update_and_delete_quotation_syncs_csv_and_db(conn, tmp_path: Path, monkeypatch):
+    item = _create_basic_item(conn, item_number="SYNC-ITEM-001")
+    roots = service.build_roots(
+        unregistered_root=tmp_path / "quotations" / "unregistered",
+        registered_root=tmp_path / "quotations" / "registered",
+    )
+    service.ensure_roots(roots)
+    monkeypatch.setattr(service, "build_roots", lambda **_: roots)
+
+    csv_path = roots.registered_csv_root / "SupplierSync" / "Q-SYNC-001.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "supplier",
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "supplier": "SupplierSync",
+                "item_number": item["item_number"],
+                "quantity": "3",
+                "quotation_number": "Q-SYNC-001",
+                "issue_date": "2026-03-01",
+                "order_date": "2026-03-01",
+                "expected_arrival": "2026-03-10",
+                "pdf_link": "",
+            }
+        )
+
+    import_result = service.import_orders_from_csv_path(
+        conn,
+        supplier_name="SupplierSync",
+        csv_path=csv_path,
+    )
+    assert import_result["status"] == "ok"
+    order_id = int(import_result["order_ids"][0])
+
+    order = service.get_order(conn, order_id)
+    updated = service.update_quotation(
+        conn,
+        int(order["quotation_id"]),
+        {
+            "issue_date": "2026-03-05",
+            "pdf_link": "quotations/registered/pdf_files/SupplierSync/Q-SYNC-001.pdf",
+        },
+    )
+    assert updated["issue_date"] == "2026-03-05"
+    assert updated["pdf_link"] == "quotations/registered/pdf_files/SupplierSync/Q-SYNC-001.pdf"
+
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+    assert rows[0]["issue_date"] == "2026-03-05"
+    assert rows[0]["pdf_link"] == "quotations/registered/pdf_files/SupplierSync/Q-SYNC-001.pdf"
+
+    delete_result = service.delete_quotation(conn, int(order["quotation_id"]))
+    assert delete_result["deleted"] is True
+    assert conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()["c"] == 0
+    assert conn.execute("SELECT COUNT(*) AS c FROM quotations").fetchone()["c"] == 0
+
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        remaining_rows = list(csv.DictReader(fp))
+    assert remaining_rows == []

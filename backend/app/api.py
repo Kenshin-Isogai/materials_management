@@ -329,6 +329,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
         conn.commit()
         return ok(result)
 
+    @app.delete("/api/orders/{order_id}")
+    def delete_order(order_id: int, conn= db):
+        result = service.delete_order(conn, order_id)
+        conn.commit()
+        return ok(result)
+
     @app.post("/api/orders/import")
     async def post_orders_import(
         file: UploadFile = File(...),
@@ -417,6 +423,12 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.put("/api/quotations/{quotation_id}")
     def put_quotation(quotation_id: int, payload: dict[str, Any], conn= db):
         result = service.update_quotation(conn, quotation_id, payload)
+        conn.commit()
+        return ok(result)
+
+    @app.delete("/api/quotations/{quotation_id}")
+    def delete_quotation(quotation_id: int, conn= db):
+        result = service.delete_quotation(conn, quotation_id)
         conn.commit()
         return ok(result)
 
