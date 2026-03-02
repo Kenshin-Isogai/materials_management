@@ -18,6 +18,10 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 ### Fixed
 
+- Fixed duplicate rows in consolidated `batch_missing_items_registration_*.csv` outputs.
+  - Unregistered batch import now de-duplicates unresolved rows by `(supplier, manufacturer_name, item_number)` across multiple source quotations in the same run.
+- Fixed unregistered order CSV discovery to avoid interference from generated missing-item register files.
+  - Order batch import now explicitly skips files under `quotations/unregistered/missing_item_registers/`.
 - Fixed consolidated missing-item register follow-up regressions.
   - Per-file temporary missing-item filenames are now supplier-prefixed to avoid same-stem collisions across suppliers during a batch run.
   - Batch flow now writes the consolidated register before deleting per-file temporary files, preventing data loss on consolidated-write failures.

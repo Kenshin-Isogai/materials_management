@@ -682,6 +682,62 @@ def test_import_unregistered_orders_missing_items_same_csv_name_different_suppli
     assert any("SupplierB__Q-001_missing_items_registration.csv" in path for path in captured_paths)
 
 
+def test_import_unregistered_orders_missing_items_batch_register_deduplicates_by_supplier_manufacturer_and_item_number(
+    conn,
+    tmp_path: Path,
+):
+    unregistered_root = tmp_path / "quotations" / "unregistered"
+    registered_root = tmp_path / "quotations" / "registered"
+
+    for supplier in ("SupplierA", "SupplierB"):
+        supplier_csv_dir = unregistered_root / "csv_files" / supplier
+        supplier_csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = supplier_csv_dir / f"{supplier}.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(
+                fp,
+                fieldnames=[
+                    "item_number",
+                    "quantity",
+                    "quotation_number",
+                    "issue_date",
+                    "order_date",
+                    "expected_arrival",
+                    "pdf_link",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "item_number": "DUP-001",
+                    "quantity": "1",
+                    "quotation_number": f"Q-{supplier}",
+                    "issue_date": "2026-02-20",
+                    "order_date": "2026-02-21",
+                    "expected_arrival": "2026-02-28",
+                    "pdf_link": "",
+                }
+            )
+
+    result = service.import_unregistered_order_csvs(
+        conn,
+        unregistered_root=unregistered_root,
+        registered_root=registered_root,
+    )
+
+    register_path = result.get("missing_items_register_csv")
+    assert register_path is not None
+
+    with Path(register_path).open("r", encoding="utf-8", newline="") as fp:
+        rows = list(csv.DictReader(fp))
+
+    assert result["missing_items"] == 2
+    assert len(rows) == 2
+    assert {row["source_supplier"] for row in rows} == {"SupplierA", "SupplierB"}
+    assert {row["item_number"] for row in rows} == {"DUP-001"}
+    assert {row["manufacturer_name"] for row in rows} == {""}
+
+
 def test_import_unregistered_orders_keeps_per_file_missing_csv_when_batch_register_write_fails(
     conn,
     tmp_path: Path,

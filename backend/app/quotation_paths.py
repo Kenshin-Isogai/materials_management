@@ -172,10 +172,12 @@ def iter_unregistered_missing_csvs(roots: QuotationRoots) -> list[Path]:
 
 
 def iter_unregistered_order_csvs(roots: QuotationRoots) -> list[Path]:
+    missing_root = roots.unregistered_missing_root.resolve()
     return sorted(
         [
             p
             for p in roots.unregistered_csv_root.rglob("*.csv")
+            if not p.resolve().is_relative_to(missing_root)
             if not p.name.endswith("_missing_items_registration.csv")
         ]
     )

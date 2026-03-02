@@ -7,6 +7,7 @@ import pytest
 from app.errors import AppError
 from app.quotation_paths import (
     build_roots,
+    iter_unregistered_order_csvs,
     normalize_legacy_path_text,
     normalize_pdf_link,
     supplier_from_unregistered_csv_path,
@@ -89,3 +90,22 @@ def test_resolve_pdf_link_with_typoed_workspace_relative_path(tmp_path: Path):
     assert normalized == "quotations/unregistered/pdf_files/SupplierA/Q-001.pdf"
     assert normalizations
     assert warnings == []
+
+
+def test_iter_unregistered_order_csvs_skips_missing_item_registers_folder(tmp_path: Path):
+    roots = build_roots(
+        unregistered_root=tmp_path / "quotations" / "unregistered",
+        registered_root=tmp_path / "quotations" / "registered",
+    )
+
+    normal_csv = roots.unregistered_csv_root / "SupplierA" / "Q-001.csv"
+    normal_csv.parent.mkdir(parents=True, exist_ok=True)
+    normal_csv.write_text("item_number,quantity\nA,1\n", encoding="utf-8")
+
+    missing_register = roots.unregistered_missing_root / "batch_missing_items_registration_20260302_120000.csv"
+    missing_register.parent.mkdir(parents=True, exist_ok=True)
+    missing_register.write_text("item_number,supplier\nA,SupplierA\n", encoding="utf-8")
+
+    order_csvs = iter_unregistered_order_csvs(roots)
+
+    assert order_csvs == [normal_csv]
