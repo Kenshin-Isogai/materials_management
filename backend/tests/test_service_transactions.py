@@ -168,6 +168,88 @@ def test_reservation_partial_quantity_cannot_exceed_remaining(conn):
     assert exc_info.value.code == "INVALID_RESERVATION_QUANTITY"
 
 
+def test_release_reservation_fails_when_active_allocations_missing(conn):
+    item = _create_basic_item(conn, item_number="ITEM-RES-INCONS-REL")
+    service.adjust_inventory(
+        conn,
+        item_id=item["item_id"],
+        quantity_delta=5,
+        location="STOCK",
+        note="seed",
+    )
+    reservation = service.create_reservation(
+        conn,
+        {
+            "item_id": item["item_id"],
+            "quantity": 4,
+            "purpose": "allocation-mismatch-release",
+        },
+    )
+    conn.execute(
+        "UPDATE reservation_allocations SET status = 'RELEASED', released_at = ? WHERE reservation_id = ?",
+        (service.now_jst_iso(), reservation["reservation_id"]),
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        service.release_reservation(conn, reservation["reservation_id"], quantity=2)
+
+    assert exc_info.value.code == "RESERVATION_ALLOCATION_INCONSISTENT"
+
+
+def test_consume_reservation_fails_when_active_allocations_missing(conn):
+    item = _create_basic_item(conn, item_number="ITEM-RES-INCONS-CON")
+    service.adjust_inventory(
+        conn,
+        item_id=item["item_id"],
+        quantity_delta=6,
+        location="STOCK",
+        note="seed",
+    )
+    reservation = service.create_reservation(
+        conn,
+        {
+            "item_id": item["item_id"],
+            "quantity": 5,
+            "purpose": "allocation-mismatch-consume",
+        },
+    )
+    conn.execute(
+        "UPDATE reservation_allocations SET status = 'CONSUMED', released_at = ? WHERE reservation_id = ?",
+        (service.now_jst_iso(), reservation["reservation_id"]),
+    )
+
+    with pytest.raises(AppError) as exc_info:
+        service.consume_reservation(conn, reservation["reservation_id"], quantity=3)
+
+    assert exc_info.value.code == "RESERVATION_ALLOCATION_INCONSISTENT"
+
+
+def test_arrival_undo_is_limited_by_stock_when_other_locations_have_inventory(conn):
+    item = _create_basic_item(conn, item_number="ITEM-UNDO-ARRIVAL-STOCK")
+    arrival_log = service.adjust_inventory(
+        conn,
+        item_id=item["item_id"],
+        quantity_delta=10,
+        location="STOCK",
+        note="arrival baseline",
+    )
+    service.move_inventory(
+        conn,
+        item_id=item["item_id"],
+        quantity=8,
+        from_location="STOCK",
+        to_location="BENCH_A",
+        note="move away from stock",
+    )
+
+    undo_result = service.undo_transaction(conn, arrival_log["log_id"])
+    conn.commit()
+
+    assert undo_result["applied_quantity"] == 2
+    assert _inventory_qty(conn, item["item_id"], "STOCK") == 0
+    assert _inventory_qty(conn, item["item_id"], "BENCH_A") == 8
+
+
 def test_import_unregistered_orders_moves_csv_and_pdf(conn, tmp_path: Path):
     item = _create_basic_item(conn, item_number="U-ITEM-001")
 

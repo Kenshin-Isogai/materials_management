@@ -3723,6 +3723,18 @@ def release_reservation(
         """,
         (reservation_id,),
     ).fetchall()
+    allocatable_quantity = sum(int(alloc["quantity"]) for alloc in allocations)
+    if allocatable_quantity < release_quantity:
+        raise AppError(
+            code="RESERVATION_ALLOCATION_INCONSISTENT",
+            message="Active allocation quantity is insufficient to release requested amount",
+            status_code=409,
+            details={
+                "reservation_id": reservation_id,
+                "requested": release_quantity,
+                "active_allocation_quantity": allocatable_quantity,
+            },
+        )
     remaining_to_release = release_quantity
     for alloc in allocations:
         if remaining_to_release <= 0:
@@ -3832,6 +3844,18 @@ def consume_reservation(
         """,
         (reservation_id,),
     ).fetchall()
+    allocatable_quantity = sum(int(alloc["quantity"]) for alloc in allocations)
+    if allocatable_quantity < consume_quantity:
+        raise AppError(
+            code="RESERVATION_ALLOCATION_INCONSISTENT",
+            message="Active allocation quantity is insufficient to consume requested amount",
+            status_code=409,
+            details={
+                "reservation_id": reservation_id,
+                "requested": consume_quantity,
+                "active_allocation_quantity": allocatable_quantity,
+            },
+        )
     remaining_to_consume = consume_quantity
     for alloc in allocations:
         if remaining_to_consume <= 0:
@@ -4561,7 +4585,7 @@ def undo_transaction(conn: sqlite3.Connection, log_id: int, note: str | None = N
             undo_of_log_id=log_id,
         )
     elif op_type == "ARRIVAL":
-        available = _get_total_available_inventory(conn, item_id)
+        available = _get_inventory_quantity(conn, item_id, "STOCK")
         if available <= 0:
             raise AppError(
                 code="UNDO_NOT_POSSIBLE",

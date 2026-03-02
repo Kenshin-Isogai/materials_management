@@ -210,3 +210,20 @@ Format style: Keep a simple date-based log while repository versioning policy is
 ### Tests
 
 - Frontend production build executed successfully.
+
+## 2026-03-02 (reservation consistency and ARRIVAL undo regression fix)
+
+### Fixed
+
+- Prevented silent reservation state corruption in allocation-based flows:
+  - `release_reservation` and `consume_reservation` now validate that the sum of `ACTIVE` `reservation_allocations` is sufficient for the requested quantity before mutating reservation rows.
+  - When active allocations are missing/insufficient, both operations now fail with `RESERVATION_ALLOCATION_INCONSISTENT` instead of updating reservation status/quantity without corresponding allocation/inventory effects.
+- Fixed ARRIVAL undo regression introduced by allocation-aware availability checks:
+  - `undo_transaction` for `ARRIVAL` now computes reversible quantity from `STOCK` on-hand only (the location actually decremented during undo), preventing false `INSUFFICIENT_STOCK` failures when non-STOCK inventory exists.
+
+### Tests
+
+- Added backend service tests covering:
+  - release failure when reservation has no/insufficient `ACTIVE` allocations
+  - consume failure when reservation has no/insufficient `ACTIVE` allocations
+  - ARRIVAL undo partial behavior when most inventory has moved out of `STOCK`
