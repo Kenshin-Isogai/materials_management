@@ -77,7 +77,11 @@ def test_reservation_release_roundtrip(conn):
 
     assert released["status"] == "RELEASED"
     assert _inventory_qty(conn, item["item_id"], "STOCK") == 8
-    assert _inventory_qty(conn, item["item_id"], "RESERVED") == 0
+    active_alloc = conn.execute(
+        "SELECT COALESCE(SUM(quantity), 0) AS qty FROM reservation_allocations WHERE reservation_id = ? AND status = 'ACTIVE'",
+        (reservation["reservation_id"],),
+    ).fetchone()
+    assert int(active_alloc["qty"]) == 0
 
 
 def test_reservation_partial_release_keeps_active(conn):
@@ -102,8 +106,12 @@ def test_reservation_partial_release_keeps_active(conn):
 
     assert released["status"] == "ACTIVE"
     assert int(released["quantity"]) == 4
-    assert _inventory_qty(conn, item["item_id"], "STOCK") == 6
-    assert _inventory_qty(conn, item["item_id"], "RESERVED") == 4
+    assert _inventory_qty(conn, item["item_id"], "STOCK") == 10
+    active_alloc = conn.execute(
+        "SELECT COALESCE(SUM(quantity), 0) AS qty FROM reservation_allocations WHERE reservation_id = ? AND status = 'ACTIVE'",
+        (reservation["reservation_id"],),
+    ).fetchone()
+    assert int(active_alloc["qty"]) == 4
 
 
 def test_reservation_partial_consume_keeps_active(conn):
@@ -128,8 +136,12 @@ def test_reservation_partial_consume_keeps_active(conn):
 
     assert consumed["status"] == "ACTIVE"
     assert int(consumed["quantity"]) == 4
-    assert _inventory_qty(conn, item["item_id"], "STOCK") == 3
-    assert _inventory_qty(conn, item["item_id"], "RESERVED") == 4
+    assert _inventory_qty(conn, item["item_id"], "STOCK") == 7
+    active_alloc = conn.execute(
+        "SELECT COALESCE(SUM(quantity), 0) AS qty FROM reservation_allocations WHERE reservation_id = ? AND status = 'ACTIVE'",
+        (reservation["reservation_id"],),
+    ).fetchone()
+    assert int(active_alloc["qty"]) == 4
 
 
 def test_reservation_partial_quantity_cannot_exceed_remaining(conn):

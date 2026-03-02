@@ -66,8 +66,8 @@ def test_inventory_reservation_and_dashboard_flow(client):
     assert inventory.status_code == 200
     rows = inventory.json()["data"]
     quantities = {row["location"]: row["quantity"] for row in rows}
-    assert quantities["STOCK"] == 6
-    assert quantities["RESERVED"] == 4
+    assert quantities["STOCK"] == 10
+    assert "RESERVED" not in quantities
 
     dashboard = client.get("/api/dashboard/summary")
     assert dashboard.status_code == 200
@@ -132,8 +132,8 @@ def test_reservation_partial_release_and_consume_endpoints(client):
     assert inventory.status_code == 200
     rows = inventory.json()["data"]
     quantities = {row["location"]: row["quantity"] for row in rows}
-    assert quantities["STOCK"] == 7
-    assert quantities["RESERVED"] == 3
+    assert quantities["STOCK"] == 10
+    assert "RESERVED" not in quantities
 
     over_release = client.post(
         f"/api/reservations/{reservation_id}/release",

@@ -118,6 +118,22 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS reservation_allocations (
+        allocation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        reservation_id INTEGER NOT NULL,
+        item_id INTEGER NOT NULL,
+        location TEXT NOT NULL CHECK (trim(location) <> ''),
+        quantity INTEGER NOT NULL CHECK (quantity > 0),
+        status TEXT NOT NULL DEFAULT 'ACTIVE'
+            CHECK (status IN ('ACTIVE', 'RELEASED', 'CONSUMED')),
+        created_at TEXT NOT NULL,
+        released_at TEXT,
+        note TEXT,
+        FOREIGN KEY (reservation_id) REFERENCES reservations (reservation_id) ON DELETE CASCADE,
+        FOREIGN KEY (item_id) REFERENCES items_master (item_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS assemblies (
         assembly_id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT NOT NULL UNIQUE CHECK (trim(name) <> ''),
@@ -245,6 +261,8 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations (status)",
     "CREATE INDEX IF NOT EXISTS idx_reservations_deadline ON reservations (deadline)",
     "CREATE INDEX IF NOT EXISTS idx_reservations_project_id ON reservations (project_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reservation_allocations_reservation_id ON reservation_allocations (reservation_id)",
+    "CREATE INDEX IF NOT EXISTS idx_reservation_allocations_item_loc_status ON reservation_allocations (item_id, location, status)",
     "CREATE INDEX IF NOT EXISTS idx_assembly_components_item_id ON assembly_components (item_id)",
     "CREATE INDEX IF NOT EXISTS idx_location_assembly_usage_location ON location_assembly_usage (location)",
     "CREATE INDEX IF NOT EXISTS idx_location_assembly_usage_assembly_id ON location_assembly_usage (assembly_id)",
