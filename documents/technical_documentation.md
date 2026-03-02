@@ -362,5 +362,6 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 - Correction endpoints:
   - `PUT /api/quotations/{quotation_id}` updates quotation metadata.
   - `DELETE /api/orders/{order_id}` deletes open (non-arrived) orders.
-  - `DELETE /api/quotations/{quotation_id}` deletes quotation and linked orders.
+  - `DELETE /api/quotations/{quotation_id}` deletes quotation and linked orders only when no linked order is already arrived.
 - Consistency rule: when these operations mutate DB rows, matching order CSV records are rewritten/removed so CSV source files and database state do not diverge.
+- CSV row identity rule for order-level maintenance: `update_order`/`delete_order` must target exactly one CSV row by order identity (including duplicate `(supplier, quotation_number, item_number)` occurrences) to prevent fan-out edits/deletes when a quotation contains repeated item rows.

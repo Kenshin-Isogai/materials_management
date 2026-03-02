@@ -2081,6 +2081,8 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
             message="update_order only supports status='Ordered' for open orders",
             status_code=422,
         )
+    row_matcher = _order_csv_row_matcher_for_identity(conn, current)
+
     conn.execute(
         """
         UPDATE orders
@@ -2094,18 +2096,11 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
     roots = build_roots()
     expected_arrival = updated.get("expected_arrival")
 
-    def _matcher(row: dict[str, Any]) -> bool:
-        return (
-            str(row.get("supplier") or "").strip() == str(updated.get("supplier_name") or "")
-            and str(row.get("quotation_number") or "").strip() == str(updated.get("quotation_number") or "")
-            and str(row.get("item_number") or "").strip() == str(updated.get("ordered_item_number") or "")
-        )
-
     def _updater(row: dict[str, Any]) -> dict[str, Any]:
         row["expected_arrival"] = expected_arrival or ""
         return row
 
-    _rewrite_order_csv_rows(roots, row_matcher=_matcher, row_updater=_updater)
+    _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=_updater)
     return updated
 
 
@@ -2117,18 +2112,12 @@ def delete_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
             message="Arrived orders cannot be deleted",
             status_code=409,
         )
+    row_matcher = _order_csv_row_matcher_for_identity(conn, order)
+
     conn.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
 
     roots = build_roots()
-
-    def _matcher(row: dict[str, Any]) -> bool:
-        return (
-            str(row.get("supplier") or "").strip() == str(order.get("supplier_name") or "")
-            and str(row.get("quotation_number") or "").strip() == str(order.get("quotation_number") or "")
-            and str(row.get("item_number") or "").strip() == str(order.get("ordered_item_number") or "")
-        )
-
-    csv_sync = _rewrite_order_csv_rows(roots, row_matcher=_matcher, row_updater=None)
+    csv_sync = _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=None)
 
     remaining = conn.execute(
         "SELECT COUNT(*) AS c FROM orders WHERE quotation_id = ?",
@@ -2144,6 +2133,47 @@ def delete_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
         "quotation_deleted": quotation_deleted,
         "csv_sync": csv_sync,
     }
+
+
+def _order_csv_row_matcher_for_identity(
+    conn: sqlite3.Connection,
+    order_row: dict[str, Any],
+) -> Any:
+    sibling_rows = conn.execute(
+        """
+        SELECT o.order_id
+        FROM orders o
+        JOIN quotations q ON q.quotation_id = o.quotation_id
+        JOIN suppliers s ON s.supplier_id = q.supplier_id
+        WHERE s.name = ?
+          AND q.quotation_number = ?
+          AND o.ordered_item_number = ?
+        ORDER BY o.order_id ASC
+        """,
+        (
+            str(order_row.get("supplier_name") or ""),
+            str(order_row.get("quotation_number") or ""),
+            str(order_row.get("ordered_item_number") or ""),
+        ),
+    ).fetchall()
+    sibling_ids = [int(row["order_id"]) for row in sibling_rows]
+    order_id = int(order_row["order_id"])
+    occurrence_index = sibling_ids.index(order_id) if order_id in sibling_ids else 0
+    seen = -1
+
+    def _matcher(csv_row: dict[str, Any]) -> bool:
+        nonlocal seen
+        is_same_order_key = (
+            str(csv_row.get("supplier") or "").strip() == str(order_row.get("supplier_name") or "")
+            and str(csv_row.get("quotation_number") or "").strip() == str(order_row.get("quotation_number") or "")
+            and str(csv_row.get("item_number") or "").strip() == str(order_row.get("ordered_item_number") or "")
+        )
+        if not is_same_order_key:
+            return False
+        seen += 1
+        return seen == occurrence_index
+
+    return _matcher
 
 
 def _normalize_manual_pdf_link(
@@ -3425,6 +3455,18 @@ def delete_quotation(conn: sqlite3.Connection, quotation_id: int) -> dict[str, A
             message=f"Quotation with id {quotation_id} not found",
             status_code=404,
         )
+
+    arrived_count_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE quotation_id = ? AND status = 'Arrived'",
+        (quotation_id,),
+    ).fetchone()
+    if int(arrived_count_row["c"] or 0) > 0:
+        raise AppError(
+            code="QUOTATION_HAS_ARRIVED_ORDERS",
+            message="Quotations linked to arrived orders cannot be deleted",
+            status_code=409,
+        )
+
     conn.execute("DELETE FROM orders WHERE quotation_id = ?", (quotation_id,))
     conn.execute("DELETE FROM quotations WHERE quotation_id = ?", (quotation_id,))
 

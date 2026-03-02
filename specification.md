@@ -1180,5 +1180,5 @@ Minimum gate for non-trivial changes:
 - Users may correct imported purchase data from frontend by:
   - editing quotation metadata (`issue_date`, `pdf_link`)
   - deleting non-arrived orders
-  - deleting quotations (with cascading delete of linked orders)
+  - deleting quotations only when all linked orders are non-arrived (then cascade delete linked orders)
 - Consistency requirement: these operations must keep persisted quotation/order CSV files and database records synchronized.

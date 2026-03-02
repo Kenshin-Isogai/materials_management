@@ -161,6 +161,8 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 - Quotation update flow now synchronizes matching source order CSV rows (`issue_date`, `pdf_link`) with DB updates.
 - Order delete and quotation delete flows now synchronize matching rows in quotation CSV files so CSV and DB remain consistent.
+- Fixed order CSV maintenance targeting for duplicate item rows: `update_order`/`delete_order` now update/delete only the CSV row corresponding to the target order identity instead of fan-out matching all duplicate `(supplier, quotation_number, item_number)` rows.
+- Hardened quotation deletion guard: `delete_quotation` now returns conflict when any linked order is `Arrived`, preventing bypass of arrived-order immutability.
 
 ### Tests
 

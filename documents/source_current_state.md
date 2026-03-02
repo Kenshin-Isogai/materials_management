@@ -119,5 +119,6 @@ Last updated: 2026-03-02 (JST)
 - Orders page now supports:
   - deleting non-arrived orders from `Order List`
   - inline editing of quotation `issue_date` and `pdf_link`
-  - deleting quotations directly from `Imported Quotations`
+  - deleting quotations directly from `Imported Quotations` (blocked if any linked order is already `Arrived`)
 - Backend now keeps CSV and DB aligned for these maintenance operations by rewriting/deleting matching rows in discovered quotation CSV files under registered/unregistered CSV roots.
+- For duplicate item rows under the same quotation, order-level CSV sync now matches a single row by per-order occurrence identity so update/delete touches only the targeted order row.
