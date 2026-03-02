@@ -18,6 +18,12 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 ### Fixed
 
+- Fixed false missing-item detection in order import when supplier/item alias casing differed from registered values.
+  - Supplier resolution now checks existing suppliers case-insensitively before creating a new supplier record.
+  - Alias resolution during order import now falls back to case-insensitive `ordered_item_number` matching within the resolved supplier scope.
+  - Missing-item registration now reuses the same case-insensitive supplier lookup behavior, preventing duplicate supplier namespaces from case-only variations.
+- Fixed false missing-item detection for visually similar SKU text variants during order import (e.g. `B1-E02-10` vs `B1−E02−10`).
+  - After exact and case-insensitive alias lookup, order import now performs normalized alias matching (NFKC + dash normalization + whitespace removal) within supplier scope.
 - Fixed duplicate rows in consolidated `batch_missing_items_registration_*.csv` outputs.
   - Unregistered batch import now de-duplicates unresolved rows by `(supplier, manufacturer_name, item_number)` across multiple source quotations in the same run.
 - Fixed unregistered order CSV discovery to avoid interference from generated missing-item register files.
@@ -41,6 +47,9 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 - Backend test suite executed: `40 passed`.
 - Added regression coverage for:
+  - case-insensitive supplier lookup reuse for order import and missing-item registration
+  - case-insensitive alias matching for order import
+  - dash-variant/normalized alias matching for order import
   - preserving source CSV/PDF when unregistered import returns `missing_items`
   - rollback safety when a CSV move fails after PDF move started (no leaked PDF relocation)
   - rejecting duplicate quotation re-import for the same supplier

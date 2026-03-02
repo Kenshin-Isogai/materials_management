@@ -92,10 +92,13 @@ Last updated: 2026-03-02 (JST)
 - Missing-item batch registration now reads both `quotations/unregistered/csv_files/**/_missing_items_registration.csv` and consolidated registers under `quotations/unregistered/missing_item_registers/`.
 - `missing_items_registration.csv` uses `supplier` (not `manufacturer`) because rows are resolved in supplier alias scope; `new_item` rows may specify `manufacturer_name` (or `manufacturer`) and default to `UNKNOWN` when blank.
 - JSON missing-item registration endpoint (`/api/register-missing/rows`) accepts both `manufacturer_name` and `manufacturer` fields for `new_item` rows.
+- Supplier resolution for order import and missing-item registration now falls back to case-insensitive lookup before creating a new supplier, preventing alias-scope mismatches from supplier name casing differences.
+- Order import alias resolution now falls back to case-insensitive `ordered_item_number` matching within a supplier when exact alias text does not match.
+- Order import alias resolution also normalizes item-number variants (NFKC, dash variants like `-`/`−`, and whitespace removal) before final alias lookup to prevent false missing-items caused by visually similar SKU text.
 
 ## 6. Quality State
 
-- Backend tests: `49 passed` (latest run on 2026-03-02).
+- Backend tests: `52 passed` (latest run on 2026-03-02).
 - Frontend production build: success (latest run on 2026-03-01).
 
 ## 7. Known Directional Gaps (intentional for current phase)

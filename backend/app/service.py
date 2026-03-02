@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 import json
 import re
+import unicodedata
 from pathlib import Path
 import shutil
 import sqlite3
@@ -134,6 +135,21 @@ def _get_or_create_supplier(conn: sqlite3.Connection, name: str) -> int:
     row = conn.execute("SELECT supplier_id FROM suppliers WHERE name = ?", (normalized,)).fetchone()
     if row:
         return int(row["supplier_id"])
+    casefold_rows = conn.execute(
+        "SELECT supplier_id FROM suppliers WHERE lower(name) = lower(?) ORDER BY supplier_id",
+        (normalized,),
+    ).fetchall()
+    if len(casefold_rows) == 1:
+        return int(casefold_rows[0]["supplier_id"])
+    if len(casefold_rows) > 1:
+        raise AppError(
+            code="AMBIGUOUS_SUPPLIER_NAME",
+            message=(
+                f"Multiple suppliers match '{normalized}' case-insensitively. "
+                "Use supplier_id to disambiguate."
+            ),
+            status_code=409,
+        )
     cur = conn.execute("INSERT INTO suppliers (name) VALUES (?)", (normalized,))
     return int(cur.lastrowid)
 
@@ -179,8 +195,67 @@ def _resolve_order_item(
         (supplier_id, ordered_item_number),
     ).fetchone()
     if alias is None:
+        alias_rows = conn.execute(
+            """
+            SELECT canonical_item_id, units_per_order
+            FROM supplier_item_aliases
+            WHERE supplier_id = ? AND lower(ordered_item_number) = lower(?)
+            ORDER BY alias_id
+            """,
+            (supplier_id, ordered_item_number),
+        ).fetchall()
+        if len(alias_rows) > 1:
+            raise AppError(
+                code="AMBIGUOUS_ORDERED_ITEM_ALIAS",
+                message=(
+                    f"Multiple aliases found for '{ordered_item_number}' under supplier {supplier_id} "
+                    "when matching case-insensitively."
+                ),
+                status_code=409,
+            )
+        if len(alias_rows) == 1:
+            alias = alias_rows[0]
+    if alias is None:
+        normalized_lookup = _normalize_item_number_for_lookup(ordered_item_number)
+        if normalized_lookup:
+            candidate_rows = conn.execute(
+                """
+                SELECT ordered_item_number, canonical_item_id, units_per_order
+                FROM supplier_item_aliases
+                WHERE supplier_id = ?
+                ORDER BY alias_id
+                """,
+                (supplier_id,),
+            ).fetchall()
+            normalized_matches = [
+                row
+                for row in candidate_rows
+                if _normalize_item_number_for_lookup(str(row["ordered_item_number"])) == normalized_lookup
+            ]
+            if len(normalized_matches) > 1:
+                raise AppError(
+                    code="AMBIGUOUS_ORDERED_ITEM_ALIAS",
+                    message=(
+                        f"Multiple aliases found for '{ordered_item_number}' under supplier {supplier_id} "
+                        "when matching normalized item numbers."
+                    ),
+                    status_code=409,
+                )
+            if len(normalized_matches) == 1:
+                alias = normalized_matches[0]
+    if alias is None:
         return None, 1
     return int(alias["canonical_item_id"]), int(alias["units_per_order"])
+
+
+def _normalize_item_number_for_lookup(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    if not normalized:
+        return ""
+    for dash in ("−", "‐", "‑", "‒", "–", "—", "―", "ー", "－"):
+        normalized = normalized.replace(dash, "-")
+    normalized = re.sub(r"\s+", "", normalized)
+    return normalized
 
 
 def _get_inventory_quantity(conn: sqlite3.Connection, item_id: int, location: str) -> int:
