@@ -552,6 +552,121 @@ def test_import_orders_missing_items_csv_includes_manufacturer_column(conn, tmp_
     assert "manufacturer_name" in headers
     assert row["manufacturer_name"] == ""
 
+
+def test_import_orders_resolves_alias_with_case_insensitive_supplier_name(conn):
+    supplier = service.create_supplier(conn, "SupplierAlias")
+    manufacturer = service.create_manufacturer(conn, "MFG-ALIAS")
+    item = service.create_item(
+        conn,
+        {
+            "item_number": "ALIAS-CANONICAL-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    )
+    service.upsert_supplier_item_alias(
+        conn,
+        supplier_id=int(supplier["supplier_id"]),
+        ordered_item_number="SUP-ALIAS-001",
+        canonical_item_number=item["item_number"],
+        units_per_order=3,
+    )
+
+    result = service.import_orders_from_rows(
+        conn,
+        supplier_name="supplieralias",
+        rows=[
+            {
+                "item_number": "SUP-ALIAS-001",
+                "quantity": "2",
+                "quotation_number": "Q-ALIAS-001",
+                "issue_date": "2026-03-02",
+                "order_date": "2026-03-02",
+                "expected_arrival": "",
+                "pdf_link": "",
+            }
+        ],
+    )
+
+    assert result["status"] == "ok"
+    order = service.get_order(conn, int(result["order_ids"][0]))
+    assert int(order["item_id"]) == int(item["item_id"])
+    assert int(order["ordered_quantity"]) == 2
+    assert int(order["order_amount"]) == 6
+
+
+def test_register_missing_items_alias_uses_case_insensitive_supplier_lookup(conn):
+    supplier = service.create_supplier(conn, "SupplierCase")
+    manufacturer = service.create_manufacturer(conn, "MFG-CASE")
+    service.create_item(
+        conn,
+        {
+            "item_number": "CASE-CANONICAL-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror",
+        },
+    )
+
+    result = service.register_missing_items_from_rows(
+        conn,
+        [
+            {
+                "supplier": "suppliercase",
+                "item_number": "CASE-ALIAS-001",
+                "resolution_type": "alias",
+                "canonical_item_number": "CASE-CANONICAL-001",
+                "units_per_order": "2",
+            }
+        ],
+    )
+
+    assert result["created_aliases"] == 1
+    aliases = service.list_supplier_item_aliases(conn, int(supplier["supplier_id"]))
+    assert len(aliases) == 1
+    assert aliases[0]["ordered_item_number"] == "CASE-ALIAS-001"
+
+
+def test_import_orders_resolves_alias_with_dash_variant_item_number(conn):
+    supplier = service.create_supplier(conn, "SupplierDash")
+    manufacturer = service.create_manufacturer(conn, "MFG-DASH")
+    item = service.create_item(
+        conn,
+        {
+            "item_number": "B1-E02",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    )
+    service.upsert_supplier_item_alias(
+        conn,
+        supplier_id=int(supplier["supplier_id"]),
+        ordered_item_number="B1-E02-10",
+        canonical_item_number="B1-E02",
+        units_per_order=10,
+    )
+
+    result = service.import_orders_from_rows(
+        conn,
+        supplier_name="SupplierDash",
+        rows=[
+            {
+                "item_number": "B1−E02−10",
+                "quantity": "2",
+                "quotation_number": "Q-DASH-001",
+                "issue_date": "2026-03-02",
+                "order_date": "2026-03-02",
+                "expected_arrival": "",
+                "pdf_link": "",
+            }
+        ],
+    )
+
+    assert result["status"] == "ok"
+    order = service.get_order(conn, int(result["order_ids"][0]))
+    assert int(order["item_id"]) == int(item["item_id"])
+    assert int(order["ordered_quantity"]) == 2
+    assert int(order["order_amount"]) == 20
+
 def test_register_unregistered_missing_items_reads_consolidated_register_folder(conn, tmp_path: Path):
     unregistered_root = tmp_path / "quotations" / "unregistered"
     registered_root = tmp_path / "quotations" / "registered"
