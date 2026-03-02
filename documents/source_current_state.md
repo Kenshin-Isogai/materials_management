@@ -1,6 +1,6 @@
 # Source Current State
 
-Last updated: 2026-03-01 (JST)
+Last updated: 2026-03-02 (JST)
 
 ## 1. System Snapshot
 
@@ -80,10 +80,15 @@ Last updated: 2026-03-01 (JST)
   - `quotations/registered/pdf_files/<supplier>/`
 - Batch import functions normalize legacy/typo paths, move files safely, and emit warnings for unresolved paths.
 - Collision-safe file move behavior is implemented (`_1`, `_2`, ... suffixing).
+- Unregistered batch order import accepts non-canonical `pdf_link` path forms (including `quotations/unregistered/...` and typo-normalizable variants) and normalizes/moves links during processing.
+- Per-file unregistered order import now executes CSV/PDF moves atomically with rollback on move failure, preventing partial file relocation.
+- Order import accepts common date formats with slash or flexible month/day (`YYYY/M/D`, `YYYY-MM-DD`) and normalizes to `YYYY-MM-DD`.
+- Fully empty CSV rows are ignored during order import to avoid false validation failures from trailing blank lines.
+- Missing-item registration now rejects unresolved `new_item` rows with all metadata blank, preventing accidental `UNKNOWN` placeholder item creation.
 
 ## 6. Quality State
 
-- Backend tests: `33 passed` (latest run on 2026-03-01).
+- Backend tests: `40 passed` (latest run on 2026-03-02).
 - Frontend production build: success (latest run on 2026-03-01).
 
 ## 7. Known Directional Gaps (intentional for current phase)

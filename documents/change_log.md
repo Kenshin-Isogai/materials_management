@@ -4,6 +4,23 @@ This file tracks meaningful changes to code, behavior, and documentation.
 
 Format style: Keep a simple date-based log while repository versioning policy is being finalized.
 
+## 2026-03-02
+
+### Fixed
+
+- Fixed unregistered order batch behavior where PDF files could be moved even if the same CSV ended in an error later in the per-file flow.
+  - Added atomic per-file filesystem move handling for unregistered import.
+  - CSV/PDF moves are now executed as one planned set, with rollback of already moved files if any move fails.
+- Clarified and verified missing-items path behavior for unregistered import:
+  - when a file returns `missing_items`, source CSV/PDF files remain under `quotations/unregistered/...`.
+
+### Tests
+
+- Backend test suite executed: `40 passed`.
+- Added regression coverage for:
+  - preserving source CSV/PDF when unregistered import returns `missing_items`
+  - rollback safety when a CSV move fails after PDF move started (no leaked PDF relocation)
+
 ## 2026-03-01
 
 ### Added
@@ -55,6 +72,19 @@ Format style: Keep a simple date-based log while repository versioning policy is
 ### Fixed
 
 - Reservation full-release/full-consume implementation adjusted to respect DB constraint `reservations.quantity > 0` by preserving original quantity on terminal status rows.
+- Fixed unregistered batch import failure where non-canonical `pdf_link` paths were incorrectly rejected by manual-import validation.
+  - Unregistered batch flow now allows non-canonical path text and resolves/normalizes PDF links in the batch post-processing step.
+- Fixed API route conflict causing `Items Import History` to show `Request validation failed`.
+  - `GET /api/items/import-jobs` no longer collides with `GET /api/items/{item_id}`.
+- Fixed manual order import UX where HTTP 422 failures could appear as "no response" in UI.
+  - Orders page now displays explicit import error messages and guidance when `pdf_link` is non-canonical for manual import.
+- Fixed unregistered batch import failures for supplier CSV date formats like `YYYY/M/D`.
+  - Date normalization now accepts slash/flexible formats and stores normalized `YYYY-MM-DD`.
+- Fixed false validation failures from trailing blank CSV rows in order import.
+  - Fully empty rows are now skipped.
+- Prevented accidental automatic creation of unresolved `UNKNOWN` items from missing-item templates.
+  - Missing-item registration now rejects `new_item` rows when category/url/description are all blank.
+  - Missing-item batch registration is now file-atomic via savepoints (no partial apply within a file on error).
 
 ### Tests
 
@@ -64,6 +94,10 @@ Format style: Keep a simple date-based log while repository versioning policy is
   - auth capability endpoint
   - partial reservation release/consume behavior (API + service)
   - invalid partial quantity handling
+  - unregistered batch import with `quotations/unregistered/...` `pdf_link`
+  - items import-jobs listing endpoint route behavior
+  - slash-date order import acceptance
+  - unresolved missing-item row rejection
 
 ## Notes
 

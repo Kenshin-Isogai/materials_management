@@ -575,6 +575,46 @@ def _move_file_preserve_name(src: Path, dst_dir: Path) -> Path:
     return target
 
 
+def _move_file_to_target(src: Path, target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(target))
+    return target
+
+
+def _execute_planned_file_moves(planned_moves: list[tuple[Path, Path]]) -> None:
+    applied_moves: list[tuple[Path, Path]] = []
+    try:
+        for src, target in planned_moves:
+            src_path = src.resolve()
+            target_path = target.resolve()
+            if str(src_path).casefold() == str(target_path).casefold():
+                continue
+            if not src_path.exists():
+                raise AppError(
+                    code="FILE_MOVE_FAILED",
+                    message=f"Source file does not exist: {src_path}",
+                    status_code=500,
+                )
+            moved_to = _move_file_to_target(src_path, target_path)
+            applied_moves.append((moved_to.resolve(), src_path))
+    except Exception as exc:  # noqa: BLE001
+        rollback_errors: list[str] = []
+        for moved_to, original_src in reversed(applied_moves):
+            try:
+                if moved_to.exists():
+                    _move_file_to_target(moved_to, original_src)
+            except Exception as rollback_exc:  # noqa: BLE001
+                rollback_errors.append(f"{moved_to} -> {original_src}: {rollback_exc}")
+        detail = f"Failed to move import files: {exc}"
+        if rollback_errors:
+            detail += f" (rollback issues: {'; '.join(rollback_errors)})"
+        raise AppError(
+            code="FILE_MOVE_FAILED",
+            message=detail,
+            status_code=500,
+        ) from exc
+
+
 def _supplier_name_from_unregistered_path(csv_path: Path, roots: QuotationRoots) -> tuple[str, list[str]]:
     return supplier_from_unregistered_csv_path(csv_path, roots=roots)
 
@@ -1928,6 +1968,7 @@ def _normalize_manual_pdf_link(
     *,
     supplier_name: str,
     row_index: int,
+    allow_noncanonical_path: bool = False,
 ) -> str | None:
     raw = (pdf_link or "").strip()
     if not raw:
@@ -1950,6 +1991,16 @@ def _normalize_manual_pdf_link(
                 status_code=422,
             )
         return f"quotations/registered/pdf_files/{supplier_name}/{filename}"
+
+    if allow_noncanonical_path:
+        filename = parts[-1]
+        if Path(filename).suffix.lower() != ".pdf":
+            raise AppError(
+                code="INVALID_CSV",
+                message=f"pdf_link target must be a .pdf file (row {row_index})",
+                status_code=422,
+            )
+        return "/".join(parts)
 
     if len(parts) != 5:
         raise AppError(
@@ -2002,6 +2053,7 @@ def _process_order_rows_for_import(
     supplier_id: int,
     rows: list[dict[str, str]],
     default_order_date: str | None = None,
+    allow_noncanonical_pdf_link: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -2012,6 +2064,8 @@ def _process_order_rows_for_import(
     supplier_name = supplier_name_row["name"] if supplier_name_row else str(supplier_id)
     normalized_default_date = normalize_optional_date(default_order_date, "default_order_date")
     for idx, row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in row.values()):
+            continue
         item_number = require_non_empty(str(row.get("item_number", "")), f"item_number (row {idx})")
         quantity_raw = row.get("quantity")
         try:
@@ -2026,6 +2080,7 @@ def _process_order_rows_for_import(
             row.get("pdf_link"),
             supplier_name=supplier_name,
             row_index=idx,
+            allow_noncanonical_path=allow_noncanonical_pdf_link,
         )
         item_id, units_per_order = _resolve_order_item(conn, supplier_id, item_number)
         if item_id is None:
@@ -2077,6 +2132,7 @@ def import_orders_from_rows(
     default_order_date: str | None = None,
     source_name: str = "order_import.csv",
     missing_output_dir: str | Path | None = None,
+    allow_noncanonical_pdf_link: bool = False,
 ) -> dict[str, Any]:
     sid = _resolve_supplier_id(conn, supplier_id, supplier_name)
     resolved, missing = _process_order_rows_for_import(
@@ -2084,6 +2140,7 @@ def import_orders_from_rows(
         supplier_id=sid,
         rows=rows,
         default_order_date=default_order_date,
+        allow_noncanonical_pdf_link=allow_noncanonical_pdf_link,
     )
     if missing:
         missing_csv_path = _write_missing_items_csv(
@@ -2207,11 +2264,19 @@ def register_unregistered_missing_items_csvs(
                     file_warnings.append(warning)
                 if warning not in warnings:
                     warnings.append(warning)
-            result = register_missing_items_from_csv_path(conn, csv_path)
-            moved_to = _move_file_preserve_name(
-                csv_path,
-                registered_csv_supplier_dir(roots, supplier_name),
-            )
+            savepoint = f"sp_register_missing_{uuid4().hex}"
+            conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                result = register_missing_items_from_csv_path(conn, csv_path)
+                moved_to = _move_file_preserve_name(
+                    csv_path,
+                    registered_csv_supplier_dir(roots, supplier_name),
+                )
+                conn.execute(f"RELEASE {savepoint}")
+            except Exception:
+                conn.execute(f"ROLLBACK TO {savepoint}")
+                conn.execute(f"RELEASE {savepoint}")
+                raise
             succeeded += 1
             report.append(
                 {
@@ -2267,6 +2332,7 @@ def _import_unregistered_order_csv_file(
         default_order_date=default_order_date,
         source_name=csv_path.name,
         missing_output_dir=csv_path.parent,
+        allow_noncanonical_pdf_link=True,
     )
     file_warnings: list[str] = []
     file_normalizations: list[dict[str, str]] = []
@@ -2286,6 +2352,11 @@ def _import_unregistered_order_csv_file(
     supplier_id = _get_or_create_supplier(conn, supplier_name)
     pdf_updates: list[dict[str, str]] = []
     pdf_cache: dict[tuple[str, str], str] = {}
+    planned_pdf_moves: list[tuple[Path, Path]] = []
+    planned_pdf_target_by_source: dict[str, Path] = {}
+    reserved_pdf_targets: set[str] = set()
+    registered_pdf_dir = registered_pdf_supplier_dir(roots, supplier_name).resolve()
+
     for row in rows:
         quotation_number = (row.get("quotation_number") or "").strip()
         pdf_link = (row.get("pdf_link") or "").strip()
@@ -2310,12 +2381,24 @@ def _import_unregistered_order_csv_file(
                 if item not in file_normalizations:
                     file_normalizations.append(item)
             if source_pdf is not None and source_pdf.exists():
-                target_dir = registered_pdf_supplier_dir(roots, supplier_name)
-                if source_pdf.resolve().is_relative_to(target_dir.resolve()):
-                    moved_pdf = source_pdf.resolve()
+                resolved_source = source_pdf.resolve()
+                if resolved_source.is_relative_to(registered_pdf_dir):
+                    final_pdf = resolved_source
                 else:
-                    moved_pdf = _move_file_preserve_name(source_pdf, target_dir)
-                normalized_pdf_link = _safe_workspace_relative(moved_pdf)
+                    source_key = str(resolved_source).casefold()
+                    planned_target = planned_pdf_target_by_source.get(source_key)
+                    if planned_target is None:
+                        predicted_target, _ = _predict_move_target(
+                            resolved_source,
+                            registered_pdf_dir,
+                            reserved_pdf_targets,
+                        )
+                        planned_target = predicted_target.resolve()
+                        planned_pdf_target_by_source[source_key] = planned_target
+                        planned_pdf_moves.append((resolved_source, planned_target))
+                        reserved_pdf_targets.add(str(planned_target).casefold())
+                    final_pdf = planned_target
+                normalized_pdf_link = _safe_workspace_relative(final_pdf)
             pdf_cache[cache_key] = normalized_pdf_link
         conn.execute(
             """
@@ -2332,10 +2415,13 @@ def _import_unregistered_order_csv_file(
             }
         )
 
-    csv_dest = _move_file_preserve_name(
-        csv_path,
-        registered_csv_supplier_dir(roots, supplier_name),
+    csv_source = csv_path.resolve()
+    csv_dest, _ = _predict_move_target(
+        csv_source,
+        registered_csv_supplier_dir(roots, supplier_name).resolve(),
+        set(),
     )
+    _execute_planned_file_moves([*planned_pdf_moves, (csv_source, csv_dest.resolve())])
     return {
         "file": str(csv_path),
         "supplier": supplier_name,
@@ -2497,7 +2583,8 @@ def import_unregistered_order_csvs(
 
 def _predict_move_target(src: Path, dst_dir: Path, reserved_targets: set[str]) -> tuple[Path, bool]:
     target = dst_dir / src.name
-    if str(target) not in reserved_targets and not target.exists():
+    target_key = str(target).casefold()
+    if target_key not in reserved_targets and not target.exists():
         return target, False
 
     stem = src.stem
@@ -2505,7 +2592,8 @@ def _predict_move_target(src: Path, dst_dir: Path, reserved_targets: set[str]) -
     idx = 1
     while True:
         candidate = dst_dir / f"{stem}_{idx}{suffix}"
-        if str(candidate) not in reserved_targets and not candidate.exists():
+        candidate_key = str(candidate).casefold()
+        if candidate_key not in reserved_targets and not candidate.exists():
             return candidate, True
         idx += 1
 
@@ -2554,7 +2642,7 @@ def migrate_quotations_layout(
                 target_root = csv_target_root if src.suffix.lower() == ".csv" else pdf_target_root
                 target_dir = target_root / supplier_name
                 predicted_target, renamed = _predict_move_target(src, target_dir, reserved_targets)
-                reserved_targets.add(str(predicted_target))
+                reserved_targets.add(str(predicted_target).casefold())
                 if renamed:
                     move_conflicts += 1
 
@@ -2715,6 +2803,8 @@ def register_missing_items_from_rows(conn: sqlite3.Connection, rows: list[dict[s
     deferred_alias_rows: list[dict[str, str]] = []
 
     for row in rows:
+        if not any(str(value or "").strip() for value in row.values()):
+            continue
         supplier = require_non_empty(str(row.get("supplier", "")), "supplier")
         supplier_id = _get_or_create_supplier(conn, supplier)
         item_number = require_non_empty(str(row.get("item_number", "")), "item_number")
@@ -2722,6 +2812,19 @@ def register_missing_items_from_rows(conn: sqlite3.Connection, rows: list[dict[s
         if resolution_type == "alias":
             deferred_alias_rows.append(row | {"_supplier_id": supplier_id, "_item_number": item_number})
             continue
+        category_value = str(row.get("category") or "").strip()
+        url_value = str(row.get("url") or "").strip()
+        description_value = str(row.get("description") or "").strip()
+        if not any((category_value, url_value, description_value)):
+            raise AppError(
+                code="MISSING_ITEM_UNRESOLVED",
+                message=(
+                    "new_item rows require at least one of category, url, or description. "
+                    "Fill details before registering missing items."
+                ),
+                status_code=422,
+                details={"supplier": supplier, "item_number": item_number},
+            )
 
         manufacturer_id = _get_or_create_manufacturer(conn, "UNKNOWN")
         existing = conn.execute(
@@ -2744,9 +2847,9 @@ def register_missing_items_from_rows(conn: sqlite3.Connection, rows: list[dict[s
                 (
                     item_number,
                     manufacturer_id,
-                    row.get("category") or None,
-                    row.get("url") or None,
-                    row.get("description") or None,
+                    category_value or None,
+                    url_value or None,
+                    description_value or None,
                 ),
             )
             item_id = int(cur.lastrowid)

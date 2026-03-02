@@ -8,6 +8,7 @@ from .errors import AppError
 
 JST = timezone(timedelta(hours=9))
 DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+SLASH_OR_FLEX_DATE_PATTERN = re.compile(r"^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$")
 
 
 def now_jst_iso() -> str:
@@ -26,6 +27,19 @@ def normalize_optional_date(value: str | None, field_name: str) -> str | None:
         return None
     if DATE_PATTERN.match(stripped):
         return stripped
+    match = SLASH_OR_FLEX_DATE_PATTERN.match(stripped)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        day = int(match.group(3))
+        try:
+            return date(year, month, day).isoformat()
+        except ValueError as exc:
+            raise AppError(
+                code="INVALID_DATE",
+                message=f"{field_name} must be YYYY-MM-DD",
+                status_code=422,
+            ) from exc
     try:
         parsed = datetime.fromisoformat(stripped)
         return parsed.date().isoformat()
@@ -67,4 +81,3 @@ def to_dict(row: sqlite3.Row | None) -> dict | None:
     if row is None:
         return None
     return {key: row[key] for key in row.keys()}
-

@@ -223,6 +223,134 @@ def test_import_unregistered_orders_moves_csv_and_pdf(conn, tmp_path: Path):
     assert str(row["pdf_link"]).endswith("Q-001.pdf")
 
 
+def test_import_unregistered_orders_missing_items_keeps_source_files(conn, tmp_path: Path):
+    unregistered_root = tmp_path / "quotations" / "unregistered"
+    registered_root = tmp_path / "quotations" / "registered"
+    supplier_csv_dir = unregistered_root / "csv_files" / "SupplierMissing"
+    supplier_pdf_dir = unregistered_root / "pdf_files" / "SupplierMissing"
+    supplier_csv_dir.mkdir(parents=True, exist_ok=True)
+    supplier_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_path = supplier_pdf_dir / "Q-MISS-001.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%missing\n")
+
+    csv_path = supplier_csv_dir / "Q-MISS-001.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "item_number": "MISSING-ITEM-001",
+                "quantity": "2",
+                "quotation_number": "Q-MISS-001",
+                "issue_date": "2026-02-20",
+                "order_date": "2026-02-21",
+                "expected_arrival": "2026-02-28",
+                "pdf_link": "Q-MISS-001.pdf",
+            }
+        )
+
+    result = service.import_unregistered_order_csvs(
+        conn,
+        unregistered_root=unregistered_root,
+        registered_root=registered_root,
+    )
+    conn.commit()
+
+    assert result["status"] == "ok"
+    assert result["succeeded"] == 0
+    assert result["missing_items"] == 1
+    assert csv_path.exists()
+    assert pdf_path.exists()
+    assert not (registered_root / "csv_files" / "SupplierMissing" / "Q-MISS-001.csv").exists()
+    assert not (registered_root / "pdf_files" / "SupplierMissing" / "Q-MISS-001.pdf").exists()
+
+
+def test_import_unregistered_orders_rolls_back_pdf_move_on_csv_move_failure(
+    conn,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    item = _create_basic_item(conn, item_number="U-ITEM-FAIL-001")
+
+    unregistered_root = tmp_path / "quotations" / "unregistered"
+    registered_root = tmp_path / "quotations" / "registered"
+    supplier_csv_dir = unregistered_root / "csv_files" / "SupplierFail"
+    supplier_pdf_dir = unregistered_root / "pdf_files" / "SupplierFail"
+    supplier_csv_dir.mkdir(parents=True, exist_ok=True)
+    supplier_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_path = supplier_pdf_dir / "Q-FAIL.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n%rollback\n")
+
+    csv_path = supplier_csv_dir / "Q-FAIL.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "item_number": item["item_number"],
+                "quantity": "2",
+                "quotation_number": "Q-FAIL",
+                "issue_date": "2026-02-20",
+                "order_date": "2026-02-21",
+                "expected_arrival": "2026-02-28",
+                "pdf_link": "Q-FAIL.pdf",
+            }
+        )
+
+    original_move = service.shutil.move
+
+    def _fail_csv_move(src: str, dst: str) -> str:
+        if Path(src).name == "Q-FAIL.csv":
+            raise OSError("simulated csv move failure")
+        return original_move(src, dst)
+
+    monkeypatch.setattr(service.shutil, "move", _fail_csv_move)
+
+    result = service.import_unregistered_order_csvs(
+        conn,
+        unregistered_root=unregistered_root,
+        registered_root=registered_root,
+    )
+
+    assert result["status"] == "error"
+    assert result["failed"] == 1
+    assert result["files"][0]["status"] == "error"
+
+    # Source files remain in unregistered when the per-file move phase fails.
+    assert csv_path.exists()
+    assert pdf_path.exists()
+    assert not (registered_root / "csv_files" / "SupplierFail" / "Q-FAIL.csv").exists()
+    assert not (registered_root / "pdf_files" / "SupplierFail" / "Q-FAIL.pdf").exists()
+
+    row = conn.execute("SELECT COUNT(*) AS c FROM orders").fetchone()
+    assert row is not None
+    assert int(row["c"]) == 0
+
+
 def test_migrate_quotations_layout_dry_run_apply_and_idempotent(conn, tmp_path: Path):
     unregistered_root = tmp_path / "quotations" / "unregistered"
     registered_root = tmp_path / "quotations" / "registered"
@@ -326,3 +454,22 @@ def test_migrate_quotations_layout_dry_run_apply_and_idempotent(conn, tmp_path: 
     assert rerun["moved"] == 0
     assert rerun["planned_csv_rewrites"] == 0
     assert rerun["planned_db_rewrites"] == 0
+
+
+def test_register_missing_requires_details_for_new_item(conn):
+    with pytest.raises(AppError) as exc_info:
+        service.register_missing_items_from_rows(
+            conn,
+            [
+                {
+                    "supplier": "SupplierA",
+                    "item_number": "UNRESOLVED-001",
+                    "resolution_type": "new_item",
+                    "category": "",
+                    "url": "",
+                    "description": "",
+                }
+            ],
+        )
+
+    assert exc_info.value.code == "MISSING_ITEM_UNRESOLVED"

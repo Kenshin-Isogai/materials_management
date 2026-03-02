@@ -210,6 +210,71 @@ def test_unregistered_order_import_endpoint(client, tmp_path: Path):
     assert (registered_root / "pdf_files" / "SupplierEndpoint" / "QE-001.pdf").exists()
 
 
+def test_unregistered_order_import_endpoint_accepts_unregistered_pdf_path(client, tmp_path: Path):
+    client.post("/api/manufacturers", json={"name": "API-UNREG-PATH-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "API-UNREG-PATH-ITEM",
+            "manufacturer_name": "API-UNREG-PATH-MFG",
+            "category": "Lens",
+        },
+    )
+
+    unregistered_root = tmp_path / "quotations" / "unregistered"
+    registered_root = tmp_path / "quotations" / "registered"
+    supplier_csv_dir = unregistered_root / "csv_files" / "SupplierPath"
+    supplier_pdf_dir = unregistered_root / "pdf_files" / "SupplierPath"
+    supplier_csv_dir.mkdir(parents=True, exist_ok=True)
+    supplier_pdf_dir.mkdir(parents=True, exist_ok=True)
+
+    pdf_path = supplier_pdf_dir / "QP-001.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 endpoint path test")
+
+    csv_path = supplier_csv_dir / "QP-001.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "item_number": "API-UNREG-PATH-ITEM",
+                "quantity": "2",
+                "quotation_number": "QP-001",
+                "issue_date": "2026-02-20",
+                "order_date": "2026-02-21",
+                "expected_arrival": "2026-03-01",
+                "pdf_link": "quotations/unregistered/pdf_files/SupplierPath/QP-001.pdf",
+            }
+        )
+
+    response = client.post(
+        "/api/orders/import-unregistered",
+        json={
+            "unregistered_root": str(unregistered_root),
+            "registered_root": str(registered_root),
+            "continue_on_error": False,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert payload["data"]["succeeded"] == 1
+    assert not csv_path.exists()
+    assert (registered_root / "csv_files" / "SupplierPath" / "QP-001.csv").exists()
+    assert (registered_root / "pdf_files" / "SupplierPath" / "QP-001.pdf").exists()
+
+
 def test_order_import_returns_missing_item_details(client):
     output = StringIO()
     writer = csv.DictWriter(
@@ -350,6 +415,51 @@ def test_order_import_rejects_unregistered_pdf_link_path(client):
     assert payload["status"] == "error"
     assert payload["error"]["code"] == "INVALID_CSV"
     assert "quotations/registered/pdf_files" in payload["error"]["message"]
+
+
+def test_order_import_accepts_slash_date_format(client):
+    client.post("/api/manufacturers", json={"name": "API-SLASH-DATE-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "API-SLASH-DATE-ITEM",
+            "manufacturer_name": "API-SLASH-DATE-MFG",
+            "category": "Lens",
+        },
+    )
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "item_number": "API-SLASH-DATE-ITEM",
+            "quantity": "1",
+            "quotation_number": "Q-SLASH-001",
+            "issue_date": "2026/2/21",
+            "order_date": "2026/2/22",
+            "expected_arrival": "2026/3/1",
+            "pdf_link": "",
+        }
+    )
+    response = client.post(
+        "/api/orders/import",
+        files={"file": ("orders.csv", output.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierSlashDate"},
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["status"] == "ok"
 
 
 def test_items_import_endpoint(client):
@@ -701,6 +811,15 @@ def test_items_import_job_undo_and_redo_flow(client):
     assert len(alias_after_redo.json()["data"]) == 1
 
 
+def test_items_import_jobs_listing_endpoint(client):
+    response = client.get("/api/items/import-jobs?per_page=20")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "ok"
+    assert isinstance(payload["data"], list)
+    assert "pagination" in payload
+
+
 def test_items_import_job_undo_blocks_when_item_changed_after_import(client):
     output = StringIO()
     writer = csv.DictWriter(
@@ -933,6 +1052,28 @@ def test_register_missing_rows_endpoint(client):
     rows = items.json()["data"]
     assert len(rows) == 1
     assert rows[0]["item_number"] == "MISS-ITEM-NEW"
+
+
+def test_register_missing_rows_endpoint_rejects_unresolved_new_item(client):
+    response = client.post(
+        "/api/register-missing/rows",
+        json={
+            "rows": [
+                {
+                    "supplier": "SupplierResolver",
+                    "item_number": "MISS-ITEM-UNRESOLVED",
+                    "resolution_type": "new_item",
+                    "category": "",
+                    "url": "",
+                    "description": "",
+                }
+            ]
+        },
+    )
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "MISSING_ITEM_UNRESOLVED"
 
 
 def test_retry_unregistered_file_endpoint(client, tmp_path: Path):

@@ -166,10 +166,6 @@ def create_app(db_path: str | None = None) -> FastAPI:
         )
         return ok(data, pagination)
 
-    @app.get("/api/items/{item_id}")
-    def get_item(item_id: int, conn= db):
-        return ok(service.get_item(conn, item_id))
-
     @app.post("/api/items")
     def post_item(body: ItemCreate, conn= db):
         result = service.create_item(conn, body.model_dump())
@@ -220,6 +216,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         result = service.redo_items_import_job(conn, import_job_id)
         conn.commit()
         return ok(result)
+
+    @app.get("/api/items/{item_id}")
+    def get_item(item_id: int, conn= db):
+        return ok(service.get_item(conn, item_id))
 
     @app.put("/api/items/{item_id}")
     def put_item(item_id: int, body: ItemUpdate, conn= db):

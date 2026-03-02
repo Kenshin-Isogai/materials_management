@@ -63,11 +63,19 @@ type UnregisteredFileReport = {
   file: string;
   supplier?: string;
   status: string;
+  error?: string;
   missing_count?: number;
   missing_csv_path?: string;
   missing_rows?: MissingItemResolverRow[];
   warnings?: string[];
   normalizations?: BatchNormalization[];
+};
+
+type BatchErrorReport = {
+  phase: "register" | "import";
+  file: string;
+  supplier?: string;
+  error: string;
 };
 
 type RegisterBatchResult = {
@@ -128,6 +136,7 @@ export function OrdersPage() {
   const [message, setMessage] = useState<string>("");
   const [missingRows, setMissingRows] = useState<MissingItemResolverRow[]>([]);
   const [batchMissingReports, setBatchMissingReports] = useState<UnregisteredFileReport[]>([]);
+  const [batchErrorReports, setBatchErrorReports] = useState<BatchErrorReport[]>([]);
   const [batchWarnings, setBatchWarnings] = useState<string[]>([]);
   const [batchNormalizations, setBatchNormalizations] = useState<BatchNormalization[]>([]);
   const [showAdvancedBatch, setShowAdvancedBatch] = useState(false);
@@ -180,6 +189,20 @@ export function OrdersPage() {
     return result;
   }
 
+  function toBatchErrorReports(
+    phase: "register" | "import",
+    files: UnregisteredFileReport[] | undefined
+  ): BatchErrorReport[] {
+    return (files ?? [])
+      .filter((entry) => entry.status === "error" && String(entry.error ?? "").trim())
+      .map((entry) => ({
+        phase,
+        file: entry.file,
+        supplier: entry.supplier,
+        error: String(entry.error),
+      }));
+  }
+
   async function submitImport(event: FormEvent) {
     event.preventDefault();
     if (!file || !supplier.trim()) return;
@@ -213,6 +236,16 @@ export function OrdersPage() {
         setMessage(`Imported ${result.imported_count ?? 0} rows.`);
       }
       await mutate();
+    } catch (error) {
+      const messageText = String(error ?? "");
+      if (messageText.includes("quotations/registered/pdf_files")) {
+        setMessage(
+          "Import failed: Manual import requires pdf_link to be blank, filename-only, or quotations/registered/pdf_files/<supplier>/<file>.pdf. " +
+          "For unregistered folder CSV files, use 'Unregistered Folder Batch'."
+        );
+      } else {
+        setMessage(`Import failed: ${messageText}`);
+      }
     } finally {
       setLoading(false);
     }
@@ -232,6 +265,7 @@ export function OrdersPage() {
     setLoading(true);
     setMessage("");
     setBatchMissingReports([]);
+    setBatchErrorReports([]);
     setBatchWarnings([]);
     setBatchNormalizations([]);
     try {
@@ -245,6 +279,7 @@ export function OrdersPage() {
       });
       setBatchWarnings(uniqueWarnings(result.warnings ?? []));
       setBatchNormalizations(uniqueNormalizations(result.normalizations ?? []));
+      setBatchErrorReports(toBatchErrorReports("register", result.files));
       setMessage(
         `Missing registration batch: status=${result.status}, processed=${result.processed}, succeeded=${result.succeeded}, failed=${result.failed}`
       );
@@ -258,6 +293,7 @@ export function OrdersPage() {
     setLoading(true);
     setMessage("");
     setBatchMissingReports([]);
+    setBatchErrorReports([]);
     setBatchWarnings([]);
     setBatchNormalizations([]);
     try {
@@ -273,6 +309,7 @@ export function OrdersPage() {
       setBatchMissingReports(
         (result.files ?? []).filter((entry) => entry.status === "missing_items")
       );
+      setBatchErrorReports(toBatchErrorReports("import", result.files));
       setBatchWarnings(uniqueWarnings(result.warnings ?? []));
       setBatchNormalizations(uniqueNormalizations(result.normalizations ?? []));
       setMessage(
@@ -288,6 +325,7 @@ export function OrdersPage() {
     setLoading(true);
     setMessage("");
     setBatchMissingReports([]);
+    setBatchErrorReports([]);
     setBatchWarnings([]);
     setBatchNormalizations([]);
     try {
@@ -311,6 +349,10 @@ export function OrdersPage() {
       setBatchMissingReports(
         (importResult.files ?? []).filter((entry) => entry.status === "missing_items")
       );
+      setBatchErrorReports([
+        ...toBatchErrorReports("register", registerResult.files),
+        ...toBatchErrorReports("import", importResult.files),
+      ]);
 
       const mergedWarnings = uniqueWarnings([
         ...(registerResult.warnings ?? []),
@@ -557,6 +599,33 @@ export function OrdersPage() {
                 </div>
               </>
             )}
+          </div>
+        )}
+        {batchErrorReports.length > 0 && (
+          <div className="mt-3 rounded-xl border border-red-200 bg-red-50 p-3">
+            <p className="mb-2 text-sm font-semibold text-red-900">Batch Errors</p>
+            <div className="overflow-x-auto">
+              <table className="min-w-[760px] text-sm">
+                <thead>
+                  <tr className="border-b border-red-200 text-left text-red-800">
+                    <th className="px-2 py-2">Phase</th>
+                    <th className="px-2 py-2">Supplier</th>
+                    <th className="px-2 py-2">File</th>
+                    <th className="px-2 py-2">Error</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {batchErrorReports.map((entry, idx) => (
+                    <tr key={`${entry.phase}-${entry.file}-${idx}`} className="border-b border-red-100">
+                      <td className="px-2 py-2">{entry.phase}</td>
+                      <td className="px-2 py-2">{entry.supplier ?? "-"}</td>
+                      <td className="px-2 py-2">{entry.file}</td>
+                      <td className="px-2 py-2">{entry.error}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
         {batchMissingReports.length > 0 && (
