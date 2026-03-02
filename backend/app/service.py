@@ -268,6 +268,53 @@ def _get_inventory_quantity(conn: sqlite3.Connection, item_id: int, location: st
     return int(row["quantity"])
 
 
+def _get_reserved_allocation_quantity(
+    conn: sqlite3.Connection, item_id: int, location: str
+) -> int:
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(quantity), 0) AS qty
+        FROM reservation_allocations
+        WHERE item_id = ? AND location = ? AND status = 'ACTIVE'
+        """,
+        (item_id, location),
+    ).fetchone()
+    if row is None:
+        return 0
+    return int(row["qty"] or 0)
+
+
+def _get_available_inventory_quantity(conn: sqlite3.Connection, item_id: int, location: str) -> int:
+    on_hand = _get_inventory_quantity(conn, item_id, location)
+    allocated = _get_reserved_allocation_quantity(conn, item_id, location)
+    return max(0, on_hand - allocated)
+
+
+def _list_item_available_inventory(
+    conn: sqlite3.Connection, item_id: int
+) -> list[tuple[str, int]]:
+    rows = conn.execute(
+        """
+        SELECT location, quantity
+        FROM inventory_ledger
+        WHERE item_id = ? AND quantity > 0 AND location <> 'RESERVED'
+        ORDER BY CASE WHEN location = 'STOCK' THEN 0 ELSE 1 END, location
+        """,
+        (item_id,),
+    ).fetchall()
+    available_rows: list[tuple[str, int]] = []
+    for row in rows:
+        location = str(row["location"])
+        available = _get_available_inventory_quantity(conn, item_id, location)
+        if available > 0:
+            available_rows.append((location, available))
+    return available_rows
+
+
+def _get_total_available_inventory(conn: sqlite3.Connection, item_id: int) -> int:
+    return sum(qty for _, qty in _list_item_available_inventory(conn, item_id))
+
+
 def _apply_inventory_delta(
     conn: sqlite3.Connection,
     item_id: int,
@@ -3544,8 +3591,19 @@ def create_reservation(conn: sqlite3.Connection, payload: dict[str, Any]) -> dic
         "ITEM_NOT_FOUND",
         f"Item with id {item_id} not found",
     )
-    _apply_inventory_delta(conn, item_id, "STOCK", -quantity)
-    _apply_inventory_delta(conn, item_id, "RESERVED", quantity)
+    available_rows = _list_item_available_inventory(conn, item_id)
+    total_available = sum(qty for _, qty in available_rows)
+    if total_available < quantity:
+        raise AppError(
+            code="INSUFFICIENT_STOCK",
+            message="Not enough available inventory for reservation",
+            status_code=409,
+            details={
+                "item_id": item_id,
+                "requested": quantity,
+                "available": total_available,
+            },
+        )
     cur = conn.execute(
         """
         INSERT INTO reservations (
@@ -3567,11 +3625,38 @@ def create_reservation(conn: sqlite3.Connection, payload: dict[str, Any]) -> dic
         operation_type="RESERVE",
         item_id=item_id,
         quantity=quantity,
-        from_location="STOCK",
-        to_location="RESERVED",
+        from_location=None,
+        to_location=None,
         note=payload.get("note") or payload.get("purpose"),
         batch_id=f"reservation-{cur.lastrowid}",
     )
+    remaining_to_allocate = quantity
+    for location, available in available_rows:
+        if remaining_to_allocate <= 0:
+            break
+        allocated = min(available, remaining_to_allocate)
+        conn.execute(
+            """
+            INSERT INTO reservation_allocations (
+                reservation_id,
+                item_id,
+                location,
+                quantity,
+                status,
+                created_at,
+                note
+            ) VALUES (?, ?, ?, ?, 'ACTIVE', ?, ?)
+            """,
+            (
+                int(cur.lastrowid),
+                item_id,
+                location,
+                allocated,
+                now_jst_iso(),
+                payload.get("note") or payload.get("purpose"),
+            ),
+        )
+        remaining_to_allocate -= allocated
     return get_reservation(conn, int(cur.lastrowid))
 
 
@@ -3629,8 +3714,60 @@ def release_reservation(
             },
         )
     item_id = int(reservation["item_id"])
-    _apply_inventory_delta(conn, item_id, "RESERVED", -release_quantity)
-    _apply_inventory_delta(conn, item_id, "STOCK", release_quantity)
+    allocations = conn.execute(
+        """
+        SELECT allocation_id, quantity
+        FROM reservation_allocations
+        WHERE reservation_id = ? AND status = 'ACTIVE'
+        ORDER BY allocation_id
+        """,
+        (reservation_id,),
+    ).fetchall()
+    allocatable_quantity = sum(int(alloc["quantity"]) for alloc in allocations)
+    if allocatable_quantity < release_quantity:
+        raise AppError(
+            code="RESERVATION_ALLOCATION_INCONSISTENT",
+            message="Active allocation quantity is insufficient to release requested amount",
+            status_code=409,
+            details={
+                "reservation_id": reservation_id,
+                "requested": release_quantity,
+                "active_allocation_quantity": allocatable_quantity,
+            },
+        )
+    remaining_to_release = release_quantity
+    for alloc in allocations:
+        if remaining_to_release <= 0:
+            break
+        alloc_qty = int(alloc["quantity"])
+        consume_alloc = min(alloc_qty, remaining_to_release)
+        left_qty = alloc_qty - consume_alloc
+        if left_qty == 0:
+            conn.execute(
+                """
+                UPDATE reservation_allocations
+                SET status = 'RELEASED', released_at = ?, note = COALESCE(?, note)
+                WHERE allocation_id = ?
+                """,
+                (now_jst_iso(), note, int(alloc["allocation_id"])),
+            )
+        else:
+            conn.execute(
+                "UPDATE reservation_allocations SET quantity = ? WHERE allocation_id = ?",
+                (left_qty, int(alloc["allocation_id"])),
+            )
+            conn.execute(
+                """
+                INSERT INTO reservation_allocations (
+                    reservation_id, item_id, location, quantity, status, created_at, released_at, note
+                )
+                SELECT reservation_id, item_id, location, ?, 'RELEASED', ?, ?, COALESCE(?, note)
+                FROM reservation_allocations
+                WHERE allocation_id = ?
+                """,
+                (consume_alloc, now_jst_iso(), now_jst_iso(), note, int(alloc["allocation_id"])),
+            )
+        remaining_to_release -= consume_alloc
 
     remaining = reserved_quantity - release_quantity
     if remaining == 0:
@@ -3659,11 +3796,11 @@ def release_reservation(
     )
     _log_transaction(
         conn,
-        operation_type="MOVE",
+        operation_type="RESERVE",
         item_id=item_id,
         quantity=release_quantity,
-        from_location="RESERVED",
-        to_location="STOCK",
+        from_location=None,
+        to_location=None,
         note=log_note,
         batch_id=f"reservation-release-{reservation_id}",
     )
@@ -3698,7 +3835,61 @@ def consume_reservation(
             },
         )
     item_id = int(reservation["item_id"])
-    _apply_inventory_delta(conn, item_id, "RESERVED", -consume_quantity)
+    allocations = conn.execute(
+        """
+        SELECT allocation_id, location, quantity
+        FROM reservation_allocations
+        WHERE reservation_id = ? AND status = 'ACTIVE'
+        ORDER BY allocation_id
+        """,
+        (reservation_id,),
+    ).fetchall()
+    allocatable_quantity = sum(int(alloc["quantity"]) for alloc in allocations)
+    if allocatable_quantity < consume_quantity:
+        raise AppError(
+            code="RESERVATION_ALLOCATION_INCONSISTENT",
+            message="Active allocation quantity is insufficient to consume requested amount",
+            status_code=409,
+            details={
+                "reservation_id": reservation_id,
+                "requested": consume_quantity,
+                "active_allocation_quantity": allocatable_quantity,
+            },
+        )
+    remaining_to_consume = consume_quantity
+    for alloc in allocations:
+        if remaining_to_consume <= 0:
+            break
+        alloc_qty = int(alloc["quantity"])
+        use_qty = min(alloc_qty, remaining_to_consume)
+        _apply_inventory_delta(conn, item_id, str(alloc["location"]), -use_qty)
+        left_qty = alloc_qty - use_qty
+        if left_qty == 0:
+            conn.execute(
+                """
+                UPDATE reservation_allocations
+                SET status = 'CONSUMED', released_at = ?, note = COALESCE(?, note)
+                WHERE allocation_id = ?
+                """,
+                (now_jst_iso(), note, int(alloc["allocation_id"])),
+            )
+        else:
+            conn.execute(
+                "UPDATE reservation_allocations SET quantity = ? WHERE allocation_id = ?",
+                (left_qty, int(alloc["allocation_id"])),
+            )
+            conn.execute(
+                """
+                INSERT INTO reservation_allocations (
+                    reservation_id, item_id, location, quantity, status, created_at, released_at, note
+                )
+                SELECT reservation_id, item_id, location, ?, 'CONSUMED', ?, ?, COALESCE(?, note)
+                FROM reservation_allocations
+                WHERE allocation_id = ?
+                """,
+                (use_qty, now_jst_iso(), now_jst_iso(), note, int(alloc["allocation_id"])),
+            )
+        remaining_to_consume -= use_qty
 
     remaining = reserved_quantity - consume_quantity
     if remaining == 0:
@@ -3730,7 +3921,7 @@ def consume_reservation(
         operation_type="CONSUME",
         item_id=item_id,
         quantity=consume_quantity,
-        from_location="RESERVED",
+        from_location=None,
         to_location=None,
         note=log_note,
         batch_id=f"reservation-consume-{reservation_id}",
@@ -4196,7 +4387,7 @@ def project_gap_analysis(conn: sqlite3.Connection, project_id: int) -> dict[str,
     rows: list[dict[str, Any]] = []
     for item_id, required_qty in sorted(required_by_item.items()):
         item = get_item(conn, item_id)
-        available = _get_inventory_quantity(conn, item_id, "STOCK")
+        available = _get_total_available_inventory(conn, item_id)
         shortage = max(0, required_qty - available)
         rows.append(
             {
@@ -4258,7 +4449,7 @@ def analyze_bom_rows(conn: sqlite3.Connection, rows: list[dict[str, Any]]) -> di
             )
             continue
         canonical_required = required_quantity * units
-        available = _get_inventory_quantity(conn, item_id, "STOCK")
+        available = _get_total_available_inventory(conn, item_id)
         shortage = max(0, canonical_required - available)
         item = get_item(conn, item_id)
         results.append(
@@ -4486,23 +4677,48 @@ def undo_transaction(conn: sqlite3.Connection, log_id: int, note: str | None = N
                 undo_of_log_id=log_id,
             )
     elif op_type == "RESERVE":
-        available = _get_inventory_quantity(conn, item_id, original["to_location"] or "RESERVED")
-        if available <= 0:
+        reservation_id: int | None = None
+        batch_id = str(original["batch_id"] or "")
+        if batch_id.startswith("reservation-"):
+            tail = batch_id.removeprefix("reservation-")
+            if tail.isdigit():
+                reservation_id = int(tail)
+        if reservation_id is None:
             raise AppError(
                 code="UNDO_NOT_POSSIBLE",
-                message="No quantity available in RESERVED for RESERVE undo",
+                message="Unable to resolve reservation for RESERVE undo",
                 status_code=409,
             )
-        applied_qty = min(qty, available)
-        _apply_inventory_delta(conn, item_id, original["to_location"] or "RESERVED", -applied_qty)
-        _apply_inventory_delta(conn, item_id, original["from_location"] or "STOCK", applied_qty)
+        reservation = get_reservation(conn, reservation_id)
+        if reservation["status"] != "ACTIVE":
+            raise AppError(
+                code="UNDO_NOT_POSSIBLE",
+                message="Reservation is no longer ACTIVE for RESERVE undo",
+                status_code=409,
+            )
+        conn.execute(
+            """
+            UPDATE reservation_allocations
+            SET status = 'RELEASED', released_at = ?, note = ?
+            WHERE reservation_id = ? AND status = 'ACTIVE'
+            """,
+            (now_jst_iso(), undo_note, reservation_id),
+        )
+        conn.execute(
+            """
+            UPDATE reservations
+            SET status = 'RELEASED', released_at = ?
+            WHERE reservation_id = ?
+            """,
+            (now_jst_iso(), reservation_id),
+        )
         undo_log = _log_transaction(
             conn,
-            operation_type="MOVE",
+            operation_type="RESERVE",
             item_id=item_id,
-            quantity=applied_qty,
-            from_location=original["to_location"] or "RESERVED",
-            to_location=original["from_location"] or "STOCK",
+            quantity=qty,
+            from_location=None,
+            to_location=None,
             note=undo_note,
             batch_id=f"undo-{log_id}",
             undo_of_log_id=log_id,

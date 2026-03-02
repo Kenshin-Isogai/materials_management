@@ -299,7 +299,7 @@ Stores current quantity snapshots per location.
 
 **Location Semantics:**
 - `STOCK` ↁEAvailable inventory
-- `RESERVED` ↁESoft-reserved inventory
+- `RESERVED` ↁELegacy compatibility location only (new reservations should not move physical stock here)
 - Any other string ↁEUser-defined locations
 
 **Rules:**
@@ -544,7 +544,7 @@ Maps raw category names to canonical category names for soft-merge behavior.
 |------|------|-----|--------|
 | MOVE | Location A | Location B | Transfer items |
 | CONSUME | Location | NULL | Remove items from inventory |
-| RESERVE | STOCK | RESERVED | Set aside for future use |
+| RESERVE | NULL | NULL | Create/release allocation records without moving physical inventory |
 | ADJUST | NULL or Location | Location or NULL | Correction (add/remove) |
 | ARRIVAL | NULL | STOCK | Add from order |
 
@@ -556,19 +556,19 @@ Maps raw category names to canonical category names for soft-merge behavior.
 
 **Creating Reservations:**
 1. Validate item exists and quantity > 0
-2. Check available quantity in STOCK
-3. Move from STOCK to RESERVED
+2. Calculate available quantity across physical locations (`inventory_ledger.quantity - active allocations`)
+3. Allocate reservation quantity from physical locations without moving inventory rows
 4. Create reservation record with purpose/deadline
 
 **Releasing Reservations:**
 1. Support full or partial release quantity
-2. Move released quantity from RESERVED to STOCK
+2. Mark corresponding active allocations as RELEASED (no inventory movement)
 3. If released quantity equals remaining reservation quantity: set status to RELEASED
 4. If released quantity is partial: keep status ACTIVE and decrement remaining reservation quantity
 
 **Consuming Reservations:**
 1. Support full or partial consume quantity
-2. Remove consumed quantity from RESERVED (to NULL)
+2. Consume from allocated physical locations and mark those allocations CONSUMED
 3. If consumed quantity equals remaining reservation quantity: set status to CONSUMED
 4. If consumed quantity is partial: keep status ACTIVE and decrement remaining reservation quantity
 

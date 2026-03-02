@@ -315,6 +315,15 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 - Full action transitions reservation status (`RELEASED` / `CONSUMED`).
 - Partial action keeps status `ACTIVE` and decrements remaining reservation quantity.
 
+### 5.1) Reservation allocation architecture (current)
+
+- Reservation no longer physically moves inventory to `RESERVED`.
+- Active reservation quantity is tracked in `reservation_allocations` by `(reservation_id, item_id, location)` rows.
+- Availability for reservation and planning uses:
+  - `available = inventory_ledger.on_hand - active_allocations`
+- Consume acts on physical inventory locations referenced by active allocations, preserving location traceability.
+- Release changes allocation status only (no inventory delta).
+
 ### 6) Import job undo/redo safety
 
 - Undo is guarded by before/after state snapshots from `import_job_effects`.

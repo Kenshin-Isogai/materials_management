@@ -54,6 +54,10 @@ Last updated: 2026-03-02 (JST)
 
 ### 3.3 Reservation Behavior
 
+- Reservation create/release no longer transfers inventory to/from `RESERVED`.
+- Active reserved quantities are tracked via per-location rows in `reservation_allocations`.
+- Partial/full release updates allocation states without changing `inventory_ledger` quantities.
+- Partial/full consume decrements physical inventory at allocated locations and transitions allocation states.
 - Reservation release/consume now supports:
   - full action (status transition to `RELEASED` / `CONSUMED`)
   - partial action (status remains `ACTIVE`, reservation quantity decreases)
