@@ -21,8 +21,9 @@ export function SnapshotPage() {
   const [data, setData] = useState<SnapshotResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [query, setQuery] = useState("");
-  const [locationFilter, setLocationFilter] = useState("all");
-  const [categoryFilter, setCategoryFilter] = useState("all");
+  const ALL_FILTER = "__ALL__";
+  const [locationFilter, setLocationFilter] = useState(ALL_FILTER);
+  const [categoryFilter, setCategoryFilter] = useState(ALL_FILTER);
   const [shortageOnly, setShortageOnly] = useState(false);
   const [shortageThreshold, setShortageThreshold] = useState("0");
   const [sortKey, setSortKey] = useState<"item_number" | "location" | "quantity" | "category">("quantity");
@@ -43,9 +44,9 @@ export function SnapshotPage() {
     const parsedThreshold = Number(shortageThreshold);
     const effectiveThreshold = Number.isFinite(parsedThreshold) ? parsedThreshold : 0;
     const rows = (data?.rows ?? []).filter((row) => {
-      if (locationFilter !== "all" && row.location !== locationFilter) return false;
+      if (locationFilter !== ALL_FILTER && row.location !== locationFilter) return false;
       const normalizedCategory = row.category ?? "Uncategorized";
-      if (categoryFilter !== "all" && normalizedCategory !== categoryFilter) return false;
+      if (categoryFilter !== ALL_FILTER && normalizedCategory !== categoryFilter) return false;
       if (shortageOnly && row.quantity > effectiveThreshold) return false;
       if (!normalizedQuery) return true;
       return [row.item_number, row.location, normalizedCategory, String(row.quantity)]
@@ -137,7 +138,7 @@ export function SnapshotPage() {
                 onChange={(e) => setQuery(e.target.value)}
               />
               <select className="input" value={locationFilter} onChange={(e) => setLocationFilter(e.target.value)}>
-                <option value="all">All locations</option>
+                <option value={ALL_FILTER}>All locations</option>
                 {locationOptions.map((location) => (
                   <option key={location} value={location}>
                     {location}
@@ -145,7 +146,7 @@ export function SnapshotPage() {
                 ))}
               </select>
               <select className="input" value={categoryFilter} onChange={(e) => setCategoryFilter(e.target.value)}>
-                <option value="all">All categories</option>
+                <option value={ALL_FILTER}>All categories</option>
                 {categoryOptions.map((category) => (
                   <option key={category} value={category}>
                     {category}
@@ -173,8 +174,8 @@ export function SnapshotPage() {
                   className="button-secondary"
                   onClick={() => {
                     setQuery("");
-                    setLocationFilter("all");
-                    setCategoryFilter("all");
+                    setLocationFilter(ALL_FILTER);
+                    setCategoryFilter(ALL_FILTER);
                     setShortageOnly(false);
                     setShortageThreshold("0");
                   }}

@@ -187,6 +187,7 @@ Format style: Keep a simple date-based log while repository versioning policy is
 - Snapshot table now defaults to quantity ascending so low-stock items can be spotted sooner for purchasing decisions.
 - Snapshot summary now shows `filtered / total` row counts for situational awareness while planning.
 - Snapshot page now includes a low-stock/shortage-only toggle with a configurable quantity threshold (`quantity <= threshold`) for faster purchase candidate extraction.
+- Snapshot location/category filter "All" sentinel now uses a non-data value (`__ALL__`) to avoid collisions with real category/location values such as `all`.
 
 ### Tests
 
