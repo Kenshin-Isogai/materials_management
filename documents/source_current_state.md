@@ -132,3 +132,4 @@ Last updated: 2026-03-02 (JST)
 
 - Added movement CSV import endpoint and service mapping to batch operations (`/api/inventory/import-csv`).
 - Added reservation CSV import endpoint with assembly-aware expansion (`/api/reservations/import-csv`), allowing one row to reserve all assembly components.
+- Movement/reservation CSV import numeric parse failures now return API validation errors (`422`) instead of internal errors for malformed rows.

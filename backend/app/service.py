@@ -2061,6 +2061,17 @@ def _normalize_inventory_csv_operation_type(value: str) -> str:
     return aliases.get(normalized, normalized)
 
 
+def _parse_csv_int_field(*, value: Any, row_index: int, field_name: str, code: str) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise AppError(
+            code=code,
+            message=f"row {row_index}: {field_name} must be an integer",
+            status_code=422,
+        ) from exc
+
+
 def import_inventory_movements_from_rows(
     conn: sqlite3.Connection,
     *,
@@ -2076,10 +2087,13 @@ def import_inventory_movements_from_rows(
         quantity_raw = row.get("quantity")
         if quantity_raw in (None, ""):
             raise AppError(code="INVALID_QUANTITY", message=f"row {idx}: quantity is required", status_code=422)
-        quantity = require_positive_int(int(quantity_raw), f"row {idx} quantity")
+        quantity = require_positive_int(
+            _parse_csv_int_field(value=quantity_raw, row_index=idx, field_name="quantity", code="INVALID_QUANTITY"),
+            f"row {idx} quantity",
+        )
         operation: dict[str, Any] = {
             "operation_type": op_type,
-            "item_id": int(item_id_raw),
+            "item_id": _parse_csv_int_field(value=item_id_raw, row_index=idx, field_name="item_id", code="INVALID_ITEM"),
             "quantity": quantity,
             "from_location": str(row.get("from_location") or "").strip() or None,
             "to_location": str(row.get("to_location") or "").strip() or None,
@@ -2130,12 +2144,19 @@ def import_reservations_from_rows(
         qty_raw = row.get("quantity")
         if qty_raw in (None, ""):
             raise AppError(code="INVALID_QUANTITY", message=f"row {idx}: quantity is required", status_code=422)
-        quantity = require_positive_int(int(qty_raw), f"row {idx} quantity")
+        quantity = require_positive_int(
+            _parse_csv_int_field(value=qty_raw, row_index=idx, field_name="quantity", code="INVALID_QUANTITY"),
+            f"row {idx} quantity",
+        )
         purpose = str(row.get("purpose") or "").strip() or None
         deadline = normalize_optional_date((row.get("deadline") or None), "deadline")
         note = str(row.get("note") or "").strip() or None
         project_id_raw = row.get("project_id")
-        project_id = int(project_id_raw) if project_id_raw not in (None, "") else None
+        project_id = (
+            _parse_csv_int_field(value=project_id_raw, row_index=idx, field_name="project_id", code="INVALID_PROJECT")
+            if project_id_raw not in (None, "")
+            else None
+        )
 
         item_id_raw = row.get("item_id")
         assembly_ref = str(row.get("assembly") or row.get("assembly_name") or "").strip()
@@ -2146,7 +2167,7 @@ def import_reservations_from_rows(
                 create_reservation(
                     conn,
                     {
-                        "item_id": int(item_id_raw),
+                        "item_id": _parse_csv_int_field(value=item_id_raw, row_index=idx, field_name="item_id", code="INVALID_ITEM"),
                         "quantity": quantity,
                         "purpose": purpose,
                         "deadline": deadline,
@@ -2162,7 +2183,16 @@ def import_reservations_from_rows(
         assembly_id = assembly_map.get(assembly_ref.casefold())
         if assembly_id is None:
             raise AppError(code="ASSEMBLY_NOT_FOUND", message=f"row {idx}: assembly '{assembly_ref}' not found", status_code=404)
-        assembly_quantity = int(assembly_qty_raw) if assembly_qty_raw not in (None, "") else 1
+        assembly_quantity = (
+            _parse_csv_int_field(
+                value=assembly_qty_raw,
+                row_index=idx,
+                field_name="assembly_quantity",
+                code="INVALID_QUANTITY",
+            )
+            if assembly_qty_raw not in (None, "")
+            else 1
+        )
         assembly_quantity = require_positive_int(assembly_quantity, f"row {idx} assembly_quantity")
         assembly = get_assembly(conn, assembly_id)
         for component in assembly.get("components", []):
