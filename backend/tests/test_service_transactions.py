@@ -682,7 +682,7 @@ def test_import_unregistered_orders_missing_items_same_csv_name_different_suppli
     assert any("SupplierB__Q-001_missing_items_registration.csv" in path for path in captured_paths)
 
 
-def test_import_unregistered_orders_missing_items_batch_register_deduplicates_by_manufacturer_and_item_number(
+def test_import_unregistered_orders_missing_items_batch_register_deduplicates_by_supplier_manufacturer_and_item_number(
     conn,
     tmp_path: Path,
 ):
@@ -732,9 +732,10 @@ def test_import_unregistered_orders_missing_items_batch_register_deduplicates_by
         rows = list(csv.DictReader(fp))
 
     assert result["missing_items"] == 2
-    assert len(rows) == 1
-    assert rows[0]["item_number"] == "DUP-001"
-    assert rows[0]["manufacturer_name"] == ""
+    assert len(rows) == 2
+    assert {row["source_supplier"] for row in rows} == {"SupplierA", "SupplierB"}
+    assert {row["item_number"] for row in rows} == {"DUP-001"}
+    assert {row["manufacturer_name"] for row in rows} == {""}
 
 
 def test_import_unregistered_orders_keeps_per_file_missing_csv_when_batch_register_write_fails(

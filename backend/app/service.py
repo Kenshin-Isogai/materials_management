@@ -582,14 +582,19 @@ def _write_batch_missing_items_register(
         ]
         writer = csv.DictWriter(fp, fieldnames=fieldnames)
         writer.writeheader()
-        seen_missing_keys: set[tuple[str, str]] = set()
+        seen_missing_keys: set[tuple[str, str, str]] = set()
         for report in missing_reports:
             source_csv = str(report.get("file", ""))
             source_supplier = str(report.get("supplier", ""))
             for row in report.get("missing_rows", []):
                 item_number = str(row.get("item_number", "")).strip()
                 manufacturer_name = str(row.get("manufacturer_name", "")).strip()
-                dedupe_key = (manufacturer_name.casefold(), item_number.casefold())
+                supplier_name = str(row.get("supplier", source_supplier)).strip()
+                dedupe_key = (
+                    supplier_name.casefold(),
+                    manufacturer_name.casefold(),
+                    item_number.casefold(),
+                )
                 if dedupe_key in seen_missing_keys:
                     continue
                 seen_missing_keys.add(dedupe_key)
