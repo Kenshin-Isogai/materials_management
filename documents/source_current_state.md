@@ -71,6 +71,7 @@ Last updated: 2026-03-02 (JST)
 - Reservations page supports partial release/consume via quantity prompt.
 - Orders page `Order List` supports client-side sorting by order id, supplier, item, quantity, expected arrival, and status.
 - Orders page now also shows an `Imported Quotations` table sourced from `GET /api/quotations` (read-only: ID, supplier, quotation number, issue date, pdf_link path).
+- Orders page mutation flows (manual import, unregistered batch steps, arrival processing) revalidate both orders and quotations datasets to avoid stale `Imported Quotations` content after successful operations.
 - Items page `Item List` supports client-side sorting by ID, item number, manufacturer, category, and URL.
 - Item List URL values render as clickable external links (`target=_blank`, `rel=noopener noreferrer`).
 - Dashboard overdue section supports keyword filtering and shows a full-table view when more than eight overdue rows match the filter.

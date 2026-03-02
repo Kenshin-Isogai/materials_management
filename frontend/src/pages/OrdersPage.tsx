@@ -144,13 +144,14 @@ export function OrdersPage() {
   const [sortKey, setSortKey] = useState<"order_id" | "supplier_name" | "canonical_item_number" | "order_amount" | "expected_arrival" | "status">("order_id");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
 
-  const { data, error, isLoading, mutate } = useSWR("/orders", () =>
+  const { data, error, isLoading, mutate: mutateOrders } = useSWR("/orders", () =>
     apiGetWithPagination<Order[]>("/orders?per_page=200")
   );
   const {
     data: quotationsData,
     error: quotationsError,
     isLoading: quotationsLoading,
+    mutate: mutateQuotations,
   } = useSWR("/quotations", () => apiGetWithPagination<Quotation[]>("/quotations?per_page=200"));
 
   const sortedOrders = useMemo(() => {
@@ -274,7 +275,7 @@ export function OrdersPage() {
         sessionStorage.removeItem(PENDING_BATCH_RETRY_KEY);
         setMessage(`Imported ${result.imported_count ?? 0} rows.`);
       }
-      await mutate();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
     } catch (error) {
       const messageText = String(error ?? "");
       if (messageText.includes("quotations/registered/pdf_files")) {
@@ -294,7 +295,7 @@ export function OrdersPage() {
     setLoading(true);
     try {
       await apiSend(`/orders/${orderId}/arrival`, { method: "POST", body: JSON.stringify({}) });
-      await mutate();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
     } finally {
       setLoading(false);
     }
@@ -322,7 +323,7 @@ export function OrdersPage() {
       setMessage(
         `Missing registration batch: status=${result.status}, processed=${result.processed}, succeeded=${result.succeeded}, failed=${result.failed}`
       );
-      await mutate();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
     } finally {
       setLoading(false);
     }
@@ -354,7 +355,7 @@ export function OrdersPage() {
       setMessage(
         `Unregistered import batch: status=${result.status}, processed=${result.processed}, succeeded=${result.succeeded}, missing_items=${result.missing_items}, failed=${result.failed}`
       );
-      await mutate();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
     } finally {
       setLoading(false);
     }
@@ -406,7 +407,7 @@ export function OrdersPage() {
       setMessage(
         `Unregistered batch complete: register(status=${registerResult.status}, processed=${registerResult.processed}, succeeded=${registerResult.succeeded}, failed=${registerResult.failed}) + import(status=${importResult.status}, processed=${importResult.processed}, succeeded=${importResult.succeeded}, missing_items=${importResult.missing_items}, failed=${importResult.failed})`
       );
-      await mutate();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
     } finally {
       setLoading(false);
     }
