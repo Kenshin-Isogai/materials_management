@@ -113,3 +113,12 @@ Last updated: 2026-03-02 (JST)
 - Multi-user concurrency hardening beyond current SQLite/local posture is not implemented.
 - Hash-based quotation duplicate detection and strict provenance metadata are planned, not yet implemented.
 - Compliance controls (retention/backup policy enforcement) are not yet implemented.
+
+## Orders/Quotations maintenance UI (latest)
+
+- Orders page now supports:
+  - deleting non-arrived orders from `Order List`
+  - inline editing of quotation `issue_date` and `pdf_link`
+  - deleting quotations directly from `Imported Quotations` (blocked if any linked order is already `Arrived`)
+- Backend now keeps CSV and DB aligned for these maintenance operations by rewriting/deleting matching rows in discovered quotation CSV files under registered/unregistered CSV roots.
+- For duplicate item rows under the same quotation, order-level CSV sync now matches a single row by per-order occurrence identity so update/delete touches only the targeted order row.

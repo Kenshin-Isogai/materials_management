@@ -141,6 +141,9 @@ export function OrdersPage() {
   const [batchNormalizations, setBatchNormalizations] = useState<BatchNormalization[]>([]);
   const [showAdvancedBatch, setShowAdvancedBatch] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [editingQuotationId, setEditingQuotationId] = useState<number | null>(null);
+  const [editingQuotationPdfLink, setEditingQuotationPdfLink] = useState("");
+  const [editingQuotationIssueDate, setEditingQuotationIssueDate] = useState("");
   const [sortKey, setSortKey] = useState<"order_id" | "supplier_name" | "canonical_item_number" | "order_amount" | "expected_arrival" | "status">("order_id");
   const [sortDirection, setSortDirection] = useState<"asc" | "desc">("desc");
 
@@ -296,6 +299,59 @@ export function OrdersPage() {
     try {
       await apiSend(`/orders/${orderId}/arrival`, { method: "POST", body: JSON.stringify({}) });
       await Promise.all([mutateOrders(), mutateQuotations()]);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function deleteOrder(orderId: number) {
+    setLoading(true);
+    try {
+      await apiSend(`/orders/${orderId}`, { method: "DELETE" });
+      setMessage(`Deleted order #${orderId}.`);
+      await Promise.all([mutateOrders(), mutateQuotations()]);
+    } catch (error) {
+      setMessage(`Delete failed: ${String(error ?? "")}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function beginEditQuotation(row: Quotation) {
+    setEditingQuotationId(row.quotation_id);
+    setEditingQuotationPdfLink(row.pdf_link ?? "");
+    setEditingQuotationIssueDate(row.issue_date ?? "");
+  }
+
+  async function saveQuotationEdit(quotationId: number) {
+    setLoading(true);
+    try {
+      await apiSend(`/quotations/${quotationId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          issue_date: editingQuotationIssueDate.trim() || null,
+          pdf_link: editingQuotationPdfLink.trim() || null,
+        }),
+      });
+      setMessage(`Updated quotation #${quotationId}.`);
+      setEditingQuotationId(null);
+      await Promise.all([mutateOrders(), mutateQuotations()]);
+    } catch (error) {
+      setMessage(`Quotation update failed: ${String(error ?? "")}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function deleteQuotation(quotationId: number) {
+    setLoading(true);
+    try {
+      await apiSend(`/quotations/${quotationId}`, { method: "DELETE" });
+      setMessage(`Deleted quotation #${quotationId} and related orders.`);
+      if (editingQuotationId === quotationId) setEditingQuotationId(null);
+      await Promise.all([mutateOrders(), mutateQuotations()]);
+    } catch (error) {
+      setMessage(`Quotation delete failed: ${String(error ?? "")}`);
     } finally {
       setLoading(false);
     }
@@ -742,17 +798,27 @@ export function OrdersPage() {
                     <td className="px-2 py-2">{row.expected_arrival ?? "-"}</td>
                     <td className="px-2 py-2">{row.status}</td>
                     <td className="px-2 py-2">
-                      {row.status === "Ordered" ? (
+                      <div className="flex gap-2">
+                        {row.status === "Ordered" ? (
+                          <button
+                            className="button-subtle"
+                            onClick={() => markArrived(row.order_id)}
+                            disabled={loading}
+                          >
+                            Mark Arrived
+                          </button>
+                        ) : (
+                          <span className="text-slate-400">-</span>
+                        )}
                         <button
                           className="button-subtle"
-                          onClick={() => markArrived(row.order_id)}
-                          disabled={loading}
+                          onClick={() => deleteOrder(row.order_id)}
+                          disabled={loading || row.status === "Arrived"}
+                          title={row.status === "Arrived" ? "Arrived orders cannot be deleted" : "Delete this order"}
                         >
-                          Mark Arrived
+                          Delete
                         </button>
-                      ) : (
-                        <span className="text-slate-400">-</span>
-                      )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -776,6 +842,7 @@ export function OrdersPage() {
                   <th className="px-2 py-2">Quotation #</th>
                   <th className="px-2 py-2">Issue Date</th>
                   <th className="px-2 py-2">PDF Link</th>
+                  <th className="px-2 py-2">Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -784,8 +851,43 @@ export function OrdersPage() {
                     <td className="px-2 py-2">#{row.quotation_id}</td>
                     <td className="px-2 py-2">{row.supplier_name}</td>
                     <td className="px-2 py-2 font-semibold">{row.quotation_number}</td>
-                    <td className="px-2 py-2">{row.issue_date ?? "-"}</td>
-                    <td className="px-2 py-2 text-slate-600">{row.pdf_link ?? "-"}</td>
+                    <td className="px-2 py-2">
+                      {editingQuotationId === row.quotation_id ? (
+                        <input
+                          className="input"
+                          value={editingQuotationIssueDate}
+                          onChange={(event) => setEditingQuotationIssueDate(event.target.value)}
+                          placeholder="YYYY-MM-DD"
+                        />
+                      ) : (
+                        row.issue_date ?? "-"
+                      )}
+                    </td>
+                    <td className="px-2 py-2 text-slate-600">
+                      {editingQuotationId === row.quotation_id ? (
+                        <input
+                          className="input"
+                          value={editingQuotationPdfLink}
+                          onChange={(event) => setEditingQuotationPdfLink(event.target.value)}
+                          placeholder="quotations/registered/pdf_files/<supplier>/<file>.pdf"
+                        />
+                      ) : (
+                        row.pdf_link ?? "-"
+                      )}
+                    </td>
+                    <td className="px-2 py-2">
+                      <div className="flex gap-2">
+                        {editingQuotationId === row.quotation_id ? (
+                          <>
+                            <button className="button-subtle" onClick={() => saveQuotationEdit(row.quotation_id)} disabled={loading}>Save</button>
+                            <button className="button-subtle" onClick={() => setEditingQuotationId(null)} disabled={loading}>Cancel</button>
+                          </>
+                        ) : (
+                          <button className="button-subtle" onClick={() => beginEditQuotation(row)} disabled={loading}>Edit</button>
+                        )}
+                        <button className="button-subtle" onClick={() => deleteQuotation(row.quotation_id)} disabled={loading}>Delete</button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>

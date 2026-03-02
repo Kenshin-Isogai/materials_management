@@ -1303,3 +1303,111 @@ def test_retry_unregistered_legacy_layout_returns_warnings(client, tmp_path: Pat
     assert not csv_path.exists()
     assert (registered_root / "csv_files" / "LegacySupplier" / "QL-001.csv").exists()
     assert (registered_root / "pdf_files" / "LegacySupplier" / "QL-001.pdf").exists()
+
+
+def test_delete_order_endpoint(client):
+    client.post("/api/manufacturers", json={"name": "API-DEL-ORDER-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "API-DEL-ORDER-ITEM",
+            "manufacturer_name": "API-DEL-ORDER-MFG",
+            "category": "Lens",
+        },
+    )
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "item_number": "API-DEL-ORDER-ITEM",
+            "quantity": "2",
+            "quotation_number": "Q-DEL-ORDER-001",
+            "issue_date": "2026-03-01",
+            "order_date": "2026-03-01",
+            "expected_arrival": "2026-03-10",
+            "pdf_link": "",
+        }
+    )
+
+    imported = client.post(
+        "/api/orders/import",
+        files={"file": ("orders.csv", output.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierDeleteOrder"},
+    )
+    assert imported.status_code == 200
+    order_id = imported.json()["data"]["order_ids"][0]
+
+    deleted = client.delete(f"/api/orders/{order_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["deleted"] is True
+
+
+
+def test_delete_quotation_endpoint_removes_related_orders(client):
+    client.post("/api/manufacturers", json={"name": "API-DEL-QUO-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "API-DEL-QUO-ITEM",
+            "manufacturer_name": "API-DEL-QUO-MFG",
+            "category": "Lens",
+        },
+    )
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "item_number": "API-DEL-QUO-ITEM",
+            "quantity": "2",
+            "quotation_number": "Q-DEL-QUO-001",
+            "issue_date": "2026-03-01",
+            "order_date": "2026-03-01",
+            "expected_arrival": "2026-03-10",
+            "pdf_link": "",
+        }
+    )
+
+    imported = client.post(
+        "/api/orders/import",
+        files={"file": ("orders.csv", output.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierDeleteQuotation"},
+    )
+    assert imported.status_code == 200
+
+    quotations = client.get("/api/quotations?supplier=SupplierDeleteQuotation&per_page=50")
+    assert quotations.status_code == 200
+    quotation_id = quotations.json()["data"][0]["quotation_id"]
+
+    deleted = client.delete(f"/api/quotations/{quotation_id}")
+    assert deleted.status_code == 200
+    assert deleted.json()["data"]["deleted"] is True
+
+    remaining_orders = client.get("/api/orders?supplier=SupplierDeleteQuotation&per_page=50")
+    assert remaining_orders.status_code == 200
+    assert remaining_orders.json()["data"] == []

@@ -144,3 +144,26 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 - Formal semantic versioning and release tags can be adopted once GitHub release workflow is started.
 - Recommended next step: map this log format to `vX.Y.Z` releases and attach migration notes per release.
+
+## 2026-03-02 (UI order/quotation maintenance)
+
+### Added
+
+- Orders API endpoints:
+  - `DELETE /api/orders/{order_id}`
+  - `DELETE /api/quotations/{quotation_id}`
+- Orders frontend UI actions:
+  - delete order from `Order List`
+  - edit quotation `issue_date` / `pdf_link`
+  - delete quotation (and linked orders)
+
+### Changed
+
+- Quotation update flow now synchronizes matching source order CSV rows (`issue_date`, `pdf_link`) with DB updates.
+- Order delete and quotation delete flows now synchronize matching rows in quotation CSV files so CSV and DB remain consistent.
+- Fixed order CSV maintenance targeting for duplicate item rows: `update_order`/`delete_order` now update/delete only the CSV row corresponding to the target order identity instead of fan-out matching all duplicate `(supplier, quotation_number, item_number)` rows.
+- Hardened quotation deletion guard: `delete_quotation` now returns conflict when any linked order is `Arrived`, preventing bypass of arrived-order immutability.
+
+### Tests
+
+- Added backend coverage for quotation update/delete CSV+DB synchronization and API delete endpoints.

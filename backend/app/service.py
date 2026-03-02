@@ -2081,6 +2081,8 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
             message="update_order only supports status='Ordered' for open orders",
             status_code=422,
         )
+    row_matcher = _order_csv_row_matcher_for_identity(conn, current)
+
     conn.execute(
         """
         UPDATE orders
@@ -2089,7 +2091,89 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
         """,
         (expected_arrival, status, order_id),
     )
-    return get_order(conn, order_id)
+    updated = get_order(conn, order_id)
+
+    roots = build_roots()
+    expected_arrival = updated.get("expected_arrival")
+
+    def _updater(row: dict[str, Any]) -> dict[str, Any]:
+        row["expected_arrival"] = expected_arrival or ""
+        return row
+
+    _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=_updater)
+    return updated
+
+
+def delete_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
+    order = get_order(conn, order_id)
+    if order["status"] == "Arrived":
+        raise AppError(
+            code="ORDER_ALREADY_ARRIVED",
+            message="Arrived orders cannot be deleted",
+            status_code=409,
+        )
+    row_matcher = _order_csv_row_matcher_for_identity(conn, order)
+
+    conn.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+
+    roots = build_roots()
+    csv_sync = _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=None)
+
+    remaining = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE quotation_id = ?",
+        (order["quotation_id"],),
+    ).fetchone()
+    quotation_deleted = False
+    if int(remaining["c"]) == 0:
+        conn.execute("DELETE FROM quotations WHERE quotation_id = ?", (order["quotation_id"],))
+        quotation_deleted = True
+    return {
+        "deleted": True,
+        "order_id": order_id,
+        "quotation_deleted": quotation_deleted,
+        "csv_sync": csv_sync,
+    }
+
+
+def _order_csv_row_matcher_for_identity(
+    conn: sqlite3.Connection,
+    order_row: dict[str, Any],
+) -> Any:
+    sibling_rows = conn.execute(
+        """
+        SELECT o.order_id
+        FROM orders o
+        JOIN quotations q ON q.quotation_id = o.quotation_id
+        JOIN suppliers s ON s.supplier_id = q.supplier_id
+        WHERE s.name = ?
+          AND q.quotation_number = ?
+          AND o.ordered_item_number = ?
+        ORDER BY o.order_id ASC
+        """,
+        (
+            str(order_row.get("supplier_name") or ""),
+            str(order_row.get("quotation_number") or ""),
+            str(order_row.get("ordered_item_number") or ""),
+        ),
+    ).fetchall()
+    sibling_ids = [int(row["order_id"]) for row in sibling_rows]
+    order_id = int(order_row["order_id"])
+    occurrence_index = sibling_ids.index(order_id) if order_id in sibling_ids else 0
+    seen = -1
+
+    def _matcher(csv_row: dict[str, Any]) -> bool:
+        nonlocal seen
+        is_same_order_key = (
+            str(csv_row.get("supplier") or "").strip() == str(order_row.get("supplier_name") or "")
+            and str(csv_row.get("quotation_number") or "").strip() == str(order_row.get("quotation_number") or "")
+            and str(csv_row.get("item_number") or "").strip() == str(order_row.get("ordered_item_number") or "")
+        )
+        if not is_same_order_key:
+            return False
+        seen += 1
+        return seen == occurrence_index
+
+    return _matcher
 
 
 def _normalize_manual_pdf_link(
@@ -2174,6 +2258,82 @@ def _normalize_manual_pdf_link(
         )
 
     return f"quotations/registered/pdf_files/{supplier_name}/{filename}"
+
+
+def _iter_order_csv_files(roots: QuotationRoots) -> list[Path]:
+    files: list[Path] = []
+    seen: set[str] = set()
+    for base in (roots.unregistered_csv_root, roots.registered_csv_root):
+        if not base.exists():
+            continue
+        for csv_file in sorted(base.rglob("*.csv"), key=lambda p: str(p).lower()):
+            try:
+                if csv_file.resolve().is_relative_to(roots.unregistered_missing_root.resolve()):
+                    continue
+            except Exception:
+                pass
+            key = str(csv_file.resolve()).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            files.append(csv_file)
+    return files
+
+
+def _rewrite_order_csv_rows(
+    roots: QuotationRoots,
+    *,
+    row_matcher: Any,
+    row_updater: Any | None = None,
+) -> dict[str, Any]:
+    rewritten_files = 0
+    updated_rows = 0
+    deleted_rows = 0
+    touched_files: list[str] = []
+
+    for csv_file in _iter_order_csv_files(roots):
+        with csv_file.open("r", encoding="utf-8-sig", newline="") as fp:
+            reader = csv.DictReader(fp)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if not fieldnames:
+            continue
+
+        changed = False
+        next_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if not row_matcher(row):
+                next_rows.append(row)
+                continue
+            changed = True
+            if row_updater is None:
+                deleted_rows += 1
+                continue
+            updated = row_updater(dict(row))
+            if updated is None:
+                deleted_rows += 1
+                continue
+            if updated != row:
+                updated_rows += 1
+            next_rows.append(updated)
+
+        if not changed:
+            continue
+
+        with csv_file.open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(next_rows)
+        rewritten_files += 1
+        touched_files.append(str(csv_file))
+
+    return {
+        "rewritten_files": rewritten_files,
+        "updated_rows": updated_rows,
+        "deleted_rows": deleted_rows,
+        "files": touched_files,
+    }
 
 
 def _process_order_rows_for_import(
@@ -3234,6 +3394,8 @@ def update_quotation(conn: sqlite3.Connection, quotation_id: int, payload: dict[
         "QUOTATION_NOT_FOUND",
         f"Quotation with id {quotation_id} not found",
     )
+    next_issue_date = normalize_optional_date(payload.get("issue_date"), "issue_date")
+    next_pdf_link = payload.get("pdf_link")
     conn.execute(
         """
         UPDATE quotations
@@ -3242,8 +3404,8 @@ def update_quotation(conn: sqlite3.Connection, quotation_id: int, payload: dict[
         WHERE quotation_id = ?
         """,
         (
-            normalize_optional_date(payload.get("issue_date"), "issue_date"),
-            payload.get("pdf_link"),
+            next_issue_date,
+            next_pdf_link,
             quotation_id,
         ),
     )
@@ -3256,7 +3418,68 @@ def update_quotation(conn: sqlite3.Connection, quotation_id: int, payload: dict[
         """,
         (quotation_id,),
     ).fetchone()
-    return dict(row)
+    updated = dict(row)
+
+    roots = build_roots()
+
+    def _matcher(csv_row: dict[str, Any]) -> bool:
+        return (
+            str(csv_row.get("supplier") or "").strip() == str(updated.get("supplier_name") or "")
+            and str(csv_row.get("quotation_number") or "").strip() == str(updated.get("quotation_number") or "")
+        )
+
+    def _updater(csv_row: dict[str, Any]) -> dict[str, Any]:
+        if next_issue_date is not None:
+            csv_row["issue_date"] = updated.get("issue_date") or ""
+        if next_pdf_link is not None:
+            csv_row["pdf_link"] = updated.get("pdf_link") or ""
+        return csv_row
+
+    _rewrite_order_csv_rows(roots, row_matcher=_matcher, row_updater=_updater)
+    return updated
+
+
+def delete_quotation(conn: sqlite3.Connection, quotation_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        """
+        SELECT q.*, s.name AS supplier_name
+        FROM quotations q
+        JOIN suppliers s ON s.supplier_id = q.supplier_id
+        WHERE q.quotation_id = ?
+        """,
+        (quotation_id,),
+    ).fetchone()
+    if row is None:
+        raise AppError(
+            code="QUOTATION_NOT_FOUND",
+            message=f"Quotation with id {quotation_id} not found",
+            status_code=404,
+        )
+
+    arrived_count_row = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE quotation_id = ? AND status = 'Arrived'",
+        (quotation_id,),
+    ).fetchone()
+    if int(arrived_count_row["c"] or 0) > 0:
+        raise AppError(
+            code="QUOTATION_HAS_ARRIVED_ORDERS",
+            message="Quotations linked to arrived orders cannot be deleted",
+            status_code=409,
+        )
+
+    conn.execute("DELETE FROM orders WHERE quotation_id = ?", (quotation_id,))
+    conn.execute("DELETE FROM quotations WHERE quotation_id = ?", (quotation_id,))
+
+    roots = build_roots()
+
+    def _matcher(csv_row: dict[str, Any]) -> bool:
+        return (
+            str(csv_row.get("supplier") or "").strip() == str(row["supplier_name"] or "")
+            and str(csv_row.get("quotation_number") or "").strip() == str(row["quotation_number"] or "")
+        )
+
+    csv_sync = _rewrite_order_csv_rows(roots, row_matcher=_matcher, row_updater=None)
+    return {"deleted": True, "quotation_id": quotation_id, "csv_sync": csv_sync}
 
 
 def list_reservations(
