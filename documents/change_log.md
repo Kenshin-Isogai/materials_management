@@ -31,6 +31,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
   - Extended split ETA update flow to append lineage events and hardened validation (`split_quantity` must be integer, positive, and split-safe).
   - Added backend API/service regression coverage for merge + lineage behavior.
 
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
+
 ### Tests
 
 - Backend test suite executed with `uv run python -m pytest`.
@@ -85,6 +92,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
 - Fixed duplicate quotation ingestion risk in order imports.
   - Order import now rejects re-import of the same `(supplier, quotation_number)` when orders already exist for that quotation.
   - API returns conflict error `DUPLICATE_QUOTATION_IMPORT` with duplicated quotation numbers in details.
+
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
 
 ### Tests
 
@@ -194,6 +208,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
   - Missing-item registration now rejects `new_item` rows when category/url/description are all blank.
   - Missing-item batch registration is now file-atomic via savepoints (no partial apply within a file on error).
 
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
+
 ### Tests
 
 - Backend test suite executed: `33 passed`.
@@ -238,6 +259,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
 - Fixed order CSV maintenance targeting for duplicate item rows: `update_order`/`delete_order` now update/delete only the CSV row corresponding to the target order identity instead of fan-out matching all duplicate `(supplier, quotation_number, item_number)` rows.
 - Hardened quotation deletion guard: `delete_quotation` now returns conflict when any linked order is `Arrived`, preventing bypass of arrived-order immutability.
 
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
+
 ### Tests
 
 - Added backend coverage for quotation update/delete CSV+DB synchronization and API delete endpoints.
@@ -267,6 +295,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
 - Snapshot page now includes a low-stock/shortage-only toggle with a configurable quantity threshold (`quantity <= threshold`) for faster purchase candidate extraction.
 - Snapshot location/category filter "All" sentinel now uses a non-data value (`__ALL__`) to avoid collisions with real category/location values such as `all`.
 
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
+
 ### Tests
 
 - Frontend production build executed successfully.
@@ -280,6 +315,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
   - When active allocations are missing/insufficient, both operations now fail with `RESERVATION_ALLOCATION_INCONSISTENT` instead of updating reservation status/quantity without corresponding allocation/inventory effects.
 - Fixed ARRIVAL undo regression introduced by allocation-aware availability checks:
   - `undo_transaction` for `ARRIVAL` now computes reversible quantity from `STOCK` on-hand only (the location actually decremented during undo), preventing false `INSUFFICIENT_STOCK` failures when non-STOCK inventory exists.
+
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
 
 ### Tests
 
@@ -319,6 +361,13 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 - Fixed merge CSV synchronization to compute source/target sibling occurrence matchers before deleting source DB row, and adjusted target occurrence handling when source precedes target so merged quantity/ETA updates apply to the correct CSV row.
 - Fixed split CSV insertion ordering so newly created split rows are appended after the existing sibling block (order-id occurrence order), preventing row-identity drift when splitting a non-final sibling row.
+
+### Fixed
+
+- Item flow stock delta accuracy:
+  - Updated transaction-to-stock delta mapping so allocation-only `RESERVE` logs (with `from_location`/`to_location` as `NULL`) no longer appear as physical stock decreases in `GET /api/items/{item_id}/flow`.
+  - Legacy reserve transactions that explicitly move into/out of `STOCK` are still reflected as stock deltas.
+  - Added backend regression coverage for reservation create/release flow timeline to prevent double-counting against reservation deadline demand.
 
 ### Tests
 

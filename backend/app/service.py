@@ -1831,7 +1831,15 @@ def _stock_delta_from_transaction(row: sqlite3.Row) -> int:
     if op == "CONSUME":
         return -qty if from_location == "STOCK" else 0
     if op == "RESERVE":
-        return -qty
+        # Reservation lifecycle logs are allocation-only events in the current
+        # architecture and typically store NULL locations. Only legacy reserve
+        # rows that explicitly touch STOCK should contribute to stock deltas.
+        delta = 0
+        if to_location == "STOCK":
+            delta += qty
+        if from_location == "STOCK":
+            delta -= qty
+        return delta
     if op == "MOVE":
         delta = 0
         if to_location == "STOCK":
