@@ -8,6 +8,11 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 ### Changed
 
+- Item-centric flow tracing workflow:
+  - Added `GET /api/items/{item_id}/flow` to provide a single timeline with stock increases/decreases and reasons.
+  - Timeline merges historical stock-changing transactions with forward-looking expected arrivals (orders) and reservation deadlines (demand).
+  - Added Item List row action `Flow` to open the timeline panel and show when/how many/why for the selected item.
+
 - Frontend workflow visibility update:
   - Added an `Orders` count column to the Orders page `Imported Quotations` table so users can immediately see how many order rows are linked to each quotation.
 

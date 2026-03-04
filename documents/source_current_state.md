@@ -1,6 +1,6 @@
 # Source Current State
 
-Last updated: 2026-03-02 (JST)
+Last updated: 2026-03-04 (JST)
 
 ## 1. System Snapshot
 
@@ -16,7 +16,7 @@ Last updated: 2026-03-02 (JST)
 
 - `backend/`
   - `main.py`: CLI entrypoint and command routing
-  - `app/api.py`: HTTP API routes (73 endpoints)
+  - `app/api.py`: HTTP API routes (74 endpoints)
   - `app/service.py`: domain logic (single business logic layer)
   - `app/db.py`: schema + indexes + migration logic (17 tables)
   - `tests/`: integration/service/path tests
@@ -84,6 +84,7 @@ Last updated: 2026-03-02 (JST)
 - Orders page mutation flows (manual import, unregistered batch steps, arrival processing) revalidate both orders and quotations datasets to avoid stale `Imported Quotations` content after successful operations.
 - Order List panel now starts collapsed and can be expanded/collapsed inline, reducing scroll distance to the `Imported Quotations` section when reviewing quotations.
 - Orders page includes an `Order Context` panel (row-level Details action) that consolidates item metadata, related order arrivals, and related quotation metadata to reduce cross-tab lookup overhead.
+- Item List now includes a row-level `Flow` action that opens an item-specific increase/decrease timeline (when/how many/why) combining transaction logs, expected order arrivals, and active reservation deadlines.
 - Items page `Item List` supports client-side sorting by ID, item number, manufacturer, category, and URL.
 - Item List URL values render as clickable external links (`target=_blank`, `rel=noopener noreferrer`).
 - Dashboard overdue section supports keyword filtering and shows a full-table view when more than eight overdue rows match the filter.
