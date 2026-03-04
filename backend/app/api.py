@@ -29,6 +29,7 @@ from .schemas import (
     LocationAssemblySetRequest,
     MissingItemRegistrationRequest,
     ManufacturerCreate,
+    OrderMergeRequest,
     OrderUpdateRequest,
     PartialArrivalRequest,
     ProjectCreate,
@@ -350,6 +351,21 @@ def create_app(db_path: str | None = None) -> FastAPI:
         result = service.delete_order(conn, order_id)
         conn.commit()
         return ok(result)
+
+    @app.post("/api/orders/merge")
+    def post_merge_orders(body: OrderMergeRequest, conn= db):
+        result = service.merge_open_orders(
+            conn,
+            source_order_id=body.source_order_id,
+            target_order_id=body.target_order_id,
+            expected_arrival=body.expected_arrival,
+        )
+        conn.commit()
+        return ok(result)
+
+    @app.get("/api/orders/{order_id}/lineage")
+    def get_order_lineage(order_id: int, conn= db):
+        return ok(service.list_order_lineage_events(conn, order_id=order_id))
 
     @app.post("/api/orders/import")
     async def post_orders_import(

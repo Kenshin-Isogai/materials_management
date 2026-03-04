@@ -4,6 +4,22 @@ This file tracks meaningful changes to code, behavior, and documentation.
 
 Format style: Keep a simple date-based log while repository versioning policy is being finalized.
 
+## 2026-03-04
+
+### Changed
+
+- Orders reliability/scalability upgrade (Phase 2):
+  - Added durable lineage storage table `order_lineage_events` to persist split/merge/arrival lineage events with timestamped metadata.
+  - Added `POST /api/orders/merge` to merge two compatible open rows (`item_id`, `quotation_id`, `ordered_item_number`) into one open row while preserving CSV/DB consistency.
+  - Added `GET /api/orders/{order_id}/lineage` so traceability views and audits can consume persisted lineage instead of inferring from mutable order rows.
+  - Extended split ETA update flow to append lineage events and hardened validation (`split_quantity` must be integer, positive, and split-safe).
+  - Added backend API/service regression coverage for merge + lineage behavior.
+
+### Tests
+
+- Backend test suite executed with `uv run python -m pytest`.
+- Frontend production build executed successfully.
+
 ## 2026-03-02
 
 ### Changed

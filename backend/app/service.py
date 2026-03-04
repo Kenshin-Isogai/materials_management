@@ -2288,6 +2288,61 @@ def get_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
     return dict(row)
 
 
+def _record_order_lineage_event(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str,
+    source_order_id: int,
+    target_order_id: int | None = None,
+    quantity: int | None = None,
+    previous_expected_arrival: str | None = None,
+    new_expected_arrival: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    cur = conn.execute(
+        """
+        INSERT INTO order_lineage_events (
+            event_type, source_order_id, target_order_id, quantity,
+            previous_expected_arrival, new_expected_arrival, note, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event_type,
+            source_order_id,
+            target_order_id,
+            quantity,
+            previous_expected_arrival,
+            new_expected_arrival,
+            note,
+            now_jst_iso(),
+        ),
+    )
+    event_id = int(cur.lastrowid)
+    row = conn.execute(
+        "SELECT * FROM order_lineage_events WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    return dict(row) if row else {"event_id": event_id}
+
+
+def list_order_lineage_events(
+    conn: sqlite3.Connection,
+    *,
+    order_id: int,
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT event_id, event_type, source_order_id, target_order_id, quantity,
+               previous_expected_arrival, new_expected_arrival, note, created_at
+        FROM order_lineage_events
+        WHERE source_order_id = ? OR target_order_id = ?
+        ORDER BY event_id ASC
+        """,
+        (order_id, order_id),
+    ).fetchall()
+    return _rows_to_dict(rows)
+
+
 def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     current = get_order(conn, order_id)
     if current["status"] == "Arrived":
@@ -2304,27 +2359,149 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
             message="update_order only supports status='Ordered' for open orders",
             status_code=422,
         )
+
+    split_quantity_raw = payload.get("split_quantity")
+    split_quantity: int | None
+    if split_quantity_raw is None:
+        split_quantity = None
+    else:
+        try:
+            split_quantity = int(split_quantity_raw)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_SPLIT_QUANTITY",
+                message="split_quantity must be an integer",
+                status_code=422,
+            ) from exc
+
     row_matcher = _order_csv_row_matcher_for_identity(conn, current)
+    roots = build_roots()
+
+    if split_quantity is None:
+        conn.execute(
+            """
+            UPDATE orders
+            SET expected_arrival = ?, status = COALESCE(?, status)
+            WHERE order_id = ?
+            """,
+            (expected_arrival, status, order_id),
+        )
+        updated = get_order(conn, order_id)
+        updated_expected_arrival = updated.get("expected_arrival")
+
+        def _updater(row: dict[str, Any]) -> dict[str, Any]:
+            row["expected_arrival"] = updated_expected_arrival or ""
+            return row
+
+        _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=_updater)
+        if current.get("expected_arrival") != updated.get("expected_arrival"):
+            _record_order_lineage_event(
+                conn,
+                event_type="ETA_UPDATE",
+                source_order_id=order_id,
+                target_order_id=order_id,
+                quantity=int(updated.get("order_amount") or 0),
+                previous_expected_arrival=current.get("expected_arrival"),
+                new_expected_arrival=updated.get("expected_arrival"),
+                note="full-order eta update",
+            )
+        return updated
+
+    require_positive_int(split_quantity, "split_quantity")
+    order_amount = int(current["order_amount"])
+    if split_quantity >= order_amount:
+        raise AppError(
+            code="INVALID_SPLIT_QUANTITY",
+            message="split_quantity must be less than current order_amount",
+            status_code=422,
+        )
+    if expected_arrival is None:
+        raise AppError(
+            code="EXPECTED_ARRIVAL_REQUIRED",
+            message="expected_arrival is required when split_quantity is provided",
+            status_code=422,
+        )
+
+    original_ordered_qty = int(current["ordered_quantity"] or order_amount)
+    split_ordered = original_ordered_qty * split_quantity
+    if split_ordered % order_amount != 0:
+        raise AppError(
+            code="PARTIAL_SPLIT_NOT_INTEGER_SAFE",
+            message="Cannot split traceability quantities without fractional values",
+            status_code=409,
+        )
+    split_ordered //= order_amount
+    remaining_ordered = original_ordered_qty - split_ordered
+    remaining_order_amount = order_amount - split_quantity
+    if split_ordered <= 0 or remaining_ordered <= 0 or remaining_order_amount <= 0:
+        raise AppError(
+            code="INVALID_PARTIAL_SPLIT",
+            message="Split would produce invalid quantities",
+            status_code=409,
+        )
 
     conn.execute(
         """
         UPDATE orders
-        SET expected_arrival = ?, status = COALESCE(?, status)
+        SET order_amount = ?, ordered_quantity = ?, status = COALESCE(?, status)
         WHERE order_id = ?
         """,
-        (expected_arrival, status, order_id),
+        (remaining_order_amount, remaining_ordered, status, order_id),
     )
-    updated = get_order(conn, order_id)
-
-    roots = build_roots()
-    expected_arrival = updated.get("expected_arrival")
+    cur = conn.execute(
+        """
+        INSERT INTO orders (
+            item_id, quotation_id, order_amount, ordered_quantity, ordered_item_number,
+            order_date, expected_arrival, arrival_date, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'Ordered')
+        """,
+        (
+            current["item_id"],
+            current["quotation_id"],
+            split_quantity,
+            split_ordered,
+            current["ordered_item_number"],
+            current["order_date"],
+            expected_arrival,
+        ),
+    )
+    split_order_id = int(cur.lastrowid)
 
     def _updater(row: dict[str, Any]) -> dict[str, Any]:
-        row["expected_arrival"] = expected_arrival or ""
+        row["quantity"] = str(remaining_ordered)
         return row
 
     _rewrite_order_csv_rows(roots, row_matcher=row_matcher, row_updater=_updater)
-    return updated
+
+    row_matcher_for_insert = _order_csv_row_matcher_for_identity(conn, get_order(conn, order_id))
+
+    def _builder(row: dict[str, Any]) -> dict[str, Any]:
+        next_row = dict(row)
+        next_row["quantity"] = str(split_ordered)
+        next_row["expected_arrival"] = expected_arrival or ""
+        next_row["order_date"] = str(current.get("order_date") or "")
+        next_row["issue_date"] = str(current.get("issue_date") or "")
+        next_row["pdf_link"] = str(current.get("pdf_link") or "")
+        return next_row
+
+    _insert_order_csv_row_after_match(roots, row_matcher=row_matcher_for_insert, row_builder=_builder)
+    _record_order_lineage_event(
+        conn,
+        event_type="ETA_SPLIT",
+        source_order_id=order_id,
+        target_order_id=split_order_id,
+        quantity=split_quantity,
+        previous_expected_arrival=current.get("expected_arrival"),
+        new_expected_arrival=expected_arrival,
+        note="partial eta postponement split",
+    )
+
+    return {
+        "order_id": order_id,
+        "split_order_id": split_order_id,
+        "updated_order": get_order(conn, order_id),
+        "created_order": get_order(conn, split_order_id),
+    }
 
 
 def delete_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
@@ -2355,6 +2532,94 @@ def delete_order(conn: sqlite3.Connection, order_id: int) -> dict[str, Any]:
         "order_id": order_id,
         "quotation_deleted": quotation_deleted,
         "csv_sync": csv_sync,
+    }
+
+
+def merge_open_orders(
+    conn: sqlite3.Connection,
+    *,
+    source_order_id: int,
+    target_order_id: int,
+    expected_arrival: str | None = None,
+) -> dict[str, Any]:
+    if source_order_id == target_order_id:
+        raise AppError(
+            code="INVALID_MERGE_PAIR",
+            message="source_order_id and target_order_id must differ",
+            status_code=422,
+        )
+
+    source = get_order(conn, source_order_id)
+    target = get_order(conn, target_order_id)
+    if source["status"] == "Arrived" or target["status"] == "Arrived":
+        raise AppError(
+            code="ORDER_ALREADY_ARRIVED",
+            message="Arrived orders cannot be merged",
+            status_code=409,
+        )
+
+    merge_keys = ("item_id", "quotation_id", "ordered_item_number")
+    if any(source[key] != target[key] for key in merge_keys):
+        raise AppError(
+            code="ORDER_MERGE_SCOPE_MISMATCH",
+            message="Orders can be merged only when item_id, quotation_id, and ordered_item_number match",
+            status_code=422,
+        )
+
+    normalized_eta = normalize_optional_date(expected_arrival, "expected_arrival")
+    final_eta = normalized_eta if normalized_eta is not None else (target.get("expected_arrival") or source.get("expected_arrival"))
+
+    target_amount = int(target["order_amount"])
+    source_amount = int(source["order_amount"])
+    target_ordered = int(target["ordered_quantity"] or target_amount)
+    source_ordered = int(source["ordered_quantity"] or source_amount)
+
+    conn.execute(
+        """
+        UPDATE orders
+        SET order_amount = ?,
+            ordered_quantity = ?,
+            expected_arrival = ?,
+            status = 'Ordered'
+        WHERE order_id = ?
+        """,
+        (target_amount + source_amount, target_ordered + source_ordered, final_eta, target_order_id),
+    )
+    conn.execute("DELETE FROM orders WHERE order_id = ?", (source_order_id,))
+
+    roots = build_roots()
+    source_matcher = _order_csv_row_matcher_for_identity(conn, source)
+    target_matcher = _order_csv_row_matcher_for_identity(conn, target)
+
+    def _target_updater(row: dict[str, Any]) -> dict[str, Any]:
+        row["quantity"] = str(target_ordered + source_ordered)
+        row["expected_arrival"] = final_eta or ""
+        return row
+
+    _merge_order_csv_rows(
+        roots,
+        source_row_matcher=source_matcher,
+        target_row_matcher=target_matcher,
+        target_row_updater=_target_updater,
+    )
+
+    event = _record_order_lineage_event(
+        conn,
+        event_type="ETA_MERGE",
+        source_order_id=source_order_id,
+        target_order_id=target_order_id,
+        quantity=source_amount,
+        previous_expected_arrival=source.get("expected_arrival"),
+        new_expected_arrival=final_eta,
+        note="merged open orders",
+    )
+
+    return {
+        "merged": True,
+        "source_order_id": source_order_id,
+        "target_order_id": target_order_id,
+        "target_order": get_order(conn, target_order_id),
+        "lineage_event": event,
     }
 
 
@@ -2557,6 +2822,89 @@ def _rewrite_order_csv_rows(
         "deleted_rows": deleted_rows,
         "files": touched_files,
     }
+
+
+def _insert_order_csv_row_after_match(
+    roots: QuotationRoots,
+    *,
+    row_matcher: Any,
+    row_builder: Any,
+) -> dict[str, Any]:
+    for csv_file in _iter_order_csv_files(roots):
+        with csv_file.open("r", encoding="utf-8-sig", newline="") as fp:
+            reader = csv.DictReader(fp)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if not fieldnames:
+            continue
+
+        next_rows: list[dict[str, Any]] = []
+        inserted = False
+        for row in rows:
+            next_rows.append(row)
+            if inserted:
+                continue
+            if not row_matcher(row):
+                continue
+            built_row = row_builder(dict(row))
+            if built_row is None:
+                inserted = True
+                continue
+            merged = {key: built_row.get(key, row.get(key, "")) for key in fieldnames}
+            next_rows.append(merged)
+            inserted = True
+
+        if not inserted:
+            continue
+
+        with csv_file.open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(next_rows)
+        return {"inserted": True, "file": str(csv_file)}
+
+    return {"inserted": False, "file": None}
+
+
+def _merge_order_csv_rows(
+    roots: QuotationRoots,
+    *,
+    source_row_matcher: Any,
+    target_row_matcher: Any,
+    target_row_updater: Any,
+) -> dict[str, Any]:
+    for csv_file in _iter_order_csv_files(roots):
+        with csv_file.open("r", encoding="utf-8-sig", newline="") as fp:
+            reader = csv.DictReader(fp)
+            fieldnames = list(reader.fieldnames or [])
+            rows = list(reader)
+
+        if not fieldnames:
+            continue
+
+        changed = False
+        next_rows: list[dict[str, Any]] = []
+        for row in rows:
+            if source_row_matcher(row):
+                changed = True
+                continue
+            if target_row_matcher(row):
+                changed = True
+                next_rows.append(target_row_updater(dict(row)))
+                continue
+            next_rows.append(row)
+
+        if not changed:
+            continue
+
+        with csv_file.open("w", encoding="utf-8", newline="") as fp:
+            writer = csv.DictWriter(fp, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(next_rows)
+        return {"updated": True, "file": str(csv_file)}
+
+    return {"updated": False, "file": None}
 
 
 def _process_order_rows_for_import(
@@ -3565,6 +3913,16 @@ def process_order_arrival(
             ),
         )
         split_order_id = int(cur.lastrowid)
+        _record_order_lineage_event(
+            conn,
+            event_type="ARRIVAL_SPLIT",
+            source_order_id=order_id,
+            target_order_id=split_order_id,
+            quantity=arrived_qty,
+            previous_expected_arrival=order.get("expected_arrival"),
+            new_expected_arrival=order.get("expected_arrival"),
+            note="partial arrival split",
+        )
 
     _apply_inventory_delta(conn, int(order["item_id"]), "STOCK", arrived_qty)
     log = _log_transaction(

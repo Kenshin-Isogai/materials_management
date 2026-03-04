@@ -72,6 +72,19 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS order_lineage_events (
+        event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL CHECK (event_type IN ('ETA_UPDATE', 'ETA_SPLIT', 'ETA_MERGE', 'ARRIVAL_SPLIT')),
+        source_order_id INTEGER NOT NULL,
+        target_order_id INTEGER,
+        quantity INTEGER,
+        previous_expected_arrival TEXT,
+        new_expected_arrival TEXT,
+        note TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS transaction_log (
         log_id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -274,6 +287,9 @@ INDEX_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_orders_ordered_item_number ON orders (ordered_item_number)",
     "CREATE INDEX IF NOT EXISTS idx_orders_status_expected_arrival ON orders (status, expected_arrival)",
     "CREATE INDEX IF NOT EXISTS idx_orders_item_status_expected_arrival ON orders (item_id, status, expected_arrival)",
+    "CREATE INDEX IF NOT EXISTS idx_order_lineage_events_source ON order_lineage_events (source_order_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_order_lineage_events_target ON order_lineage_events (target_order_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_order_lineage_events_type_created ON order_lineage_events (event_type, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_supplier_item_aliases_canonical_item_id ON supplier_item_aliases (canonical_item_id)",
     "CREATE INDEX IF NOT EXISTS idx_category_aliases_canonical_category ON category_aliases (canonical_category)",
     "CREATE INDEX IF NOT EXISTS idx_category_aliases_updated_at ON category_aliases (updated_at)",
@@ -391,6 +407,43 @@ def _normalize_date_column(conn: sqlite3.Connection, table: str, column: str) ->
         )
 
 
+def _recreate_order_lineage_without_fk(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "order_lineage_events"):
+        return
+    fk_rows = conn.execute("PRAGMA foreign_key_list(order_lineage_events)").fetchall()
+    if not fk_rows:
+        return
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS order_lineage_events_new (
+            event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL CHECK (event_type IN ('ETA_UPDATE', 'ETA_SPLIT', 'ETA_MERGE', 'ARRIVAL_SPLIT')),
+            source_order_id INTEGER NOT NULL,
+            target_order_id INTEGER,
+            quantity INTEGER,
+            previous_expected_arrival TEXT,
+            new_expected_arrival TEXT,
+            note TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO order_lineage_events_new (
+            event_id, event_type, source_order_id, target_order_id, quantity,
+            previous_expected_arrival, new_expected_arrival, note, created_at
+        )
+        SELECT
+            event_id, event_type, source_order_id, target_order_id, quantity,
+            previous_expected_arrival, new_expected_arrival, note, created_at
+        FROM order_lineage_events
+        """
+    )
+    conn.execute("DROP TABLE order_lineage_events")
+    conn.execute("ALTER TABLE order_lineage_events_new RENAME TO order_lineage_events")
+
+
 def _apply_schema(conn: sqlite3.Connection) -> None:
     for statement in SCHEMA_STATEMENTS:
         conn.execute(statement)
@@ -403,6 +456,9 @@ def _apply_schema(conn: sqlite3.Connection) -> None:
 def migrate_db(conn: sqlite3.Connection) -> None:
     # Keep migration idempotent so startup can run this each time.
     _apply_schema(conn)
+    _recreate_order_lineage_without_fk(conn)
+    for statement in INDEX_STATEMENTS:
+        conn.execute(statement)
     for definition in (
         "ordered_quantity INTEGER",
         "ordered_item_number TEXT",

@@ -1326,6 +1326,83 @@ def test_delete_order_endpoint(client):
     assert deleted.status_code == 200
     assert deleted.json()["data"]["deleted"] is True
 
+def test_merge_orders_endpoint_merges_and_returns_lineage(client):
+    client.post("/api/manufacturers", json={"name": "API-MERGE-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "API-MERGE-ITEM",
+            "manufacturer_name": "API-MERGE-MFG",
+            "category": "Lens",
+        },
+    )
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "item_number": "API-MERGE-ITEM",
+            "quantity": "20",
+            "quotation_number": "Q-MERGE-001",
+            "issue_date": "2026-03-01",
+            "order_date": "2026-03-01",
+            "expected_arrival": "2026-03-10",
+            "pdf_link": "",
+        }
+    )
+    writer.writerow(
+        {
+            "item_number": "API-MERGE-ITEM",
+            "quantity": "30",
+            "quotation_number": "Q-MERGE-001",
+            "issue_date": "2026-03-01",
+            "order_date": "2026-03-01",
+            "expected_arrival": "2026-03-15",
+            "pdf_link": "",
+        }
+    )
+
+    imported = client.post(
+        "/api/orders/import",
+        files={"file": ("orders.csv", output.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierMergeApi"},
+    )
+    assert imported.status_code == 200
+    source_order_id = imported.json()["data"]["order_ids"][0]
+    target_order_id = imported.json()["data"]["order_ids"][1]
+
+    merged = client.post(
+        "/api/orders/merge",
+        json={
+            "source_order_id": source_order_id,
+            "target_order_id": target_order_id,
+            "expected_arrival": "2026-03-20",
+        },
+    )
+    assert merged.status_code == 200
+    assert merged.json()["data"]["target_order"]["order_amount"] == 50
+    assert merged.json()["data"]["target_order"]["expected_arrival"] == "2026-03-20"
+
+    lineage = client.get(f"/api/orders/{target_order_id}/lineage")
+    assert lineage.status_code == 200
+    assert any(
+        row["event_type"] == "ETA_MERGE" and row["source_order_id"] == source_order_id
+        for row in lineage.json()["data"]
+    )
+
+
 def test_delete_quotation_endpoint_removes_related_orders(client):
     client.post("/api/manufacturers", json={"name": "API-DEL-QUO-MFG"})
     client.post(

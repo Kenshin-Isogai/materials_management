@@ -1121,6 +1121,162 @@ def test_update_and_delete_order_with_duplicate_item_rows_only_touches_target_or
     assert len(rows_after_delete) == 1
     assert rows_after_delete[0]["quantity"] == "3"
 
+def test_update_order_can_split_partial_eta_with_csv_sync(conn, tmp_path: Path, monkeypatch):
+    item = _create_basic_item(conn, item_number="SYNC-SPLIT-001")
+    roots = service.build_roots(
+        unregistered_root=tmp_path / "quotations" / "unregistered",
+        registered_root=tmp_path / "quotations" / "registered",
+    )
+    service.ensure_roots(roots)
+    monkeypatch.setattr(service, "build_roots", lambda **_: roots)
+
+    csv_path = roots.registered_csv_root / "SupplierSplit" / "Q-SPLIT-001.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "supplier",
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "supplier": "SupplierSplit",
+                "item_number": item["item_number"],
+                "quantity": "50",
+                "quotation_number": "Q-SPLIT-001",
+                "issue_date": "2026-04-01",
+                "order_date": "2026-04-01",
+                "expected_arrival": "2026-04-10",
+                "pdf_link": "",
+            }
+        )
+
+    import_result = service.import_orders_from_csv_path(
+        conn,
+        supplier_name="SupplierSplit",
+        csv_path=csv_path,
+    )
+    assert import_result["status"] == "ok"
+    order_id = int(import_result["order_ids"][0])
+
+    result = service.update_order(
+        conn,
+        order_id,
+        {
+            "expected_arrival": "2026-04-25",
+            "split_quantity": 30,
+        },
+    )
+
+    assert result["order_id"] == order_id
+    assert result["updated_order"]["order_amount"] == 20
+    assert result["updated_order"]["expected_arrival"] == "2026-04-10"
+    assert result["created_order"]["order_amount"] == 30
+    assert result["created_order"]["expected_arrival"] == "2026-04-25"
+
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        rows_after_update = list(csv.DictReader(fp))
+    assert len(rows_after_update) == 2
+    assert rows_after_update[0]["quantity"] == "20"
+    assert rows_after_update[0]["expected_arrival"] == "2026-04-10"
+    assert rows_after_update[1]["quantity"] == "30"
+    assert rows_after_update[1]["expected_arrival"] == "2026-04-25"
+
+
+def test_merge_open_orders_records_lineage_and_syncs_csv(conn, tmp_path: Path, monkeypatch):
+    item = _create_basic_item(conn, item_number="SYNC-MERGE-001")
+    roots = service.build_roots(
+        unregistered_root=tmp_path / "quotations" / "unregistered",
+        registered_root=tmp_path / "quotations" / "registered",
+    )
+    service.ensure_roots(roots)
+    monkeypatch.setattr(service, "build_roots", lambda **_: roots)
+
+    csv_path = roots.registered_csv_root / "SupplierMerge" / "Q-MERGE-001.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as fp:
+        writer = csv.DictWriter(
+            fp,
+            fieldnames=[
+                "supplier",
+                "item_number",
+                "quantity",
+                "quotation_number",
+                "issue_date",
+                "order_date",
+                "expected_arrival",
+                "pdf_link",
+            ],
+        )
+        writer.writeheader()
+        writer.writerow(
+            {
+                "supplier": "SupplierMerge",
+                "item_number": item["item_number"],
+                "quantity": "20",
+                "quotation_number": "Q-MERGE-001",
+                "issue_date": "2026-05-01",
+                "order_date": "2026-05-01",
+                "expected_arrival": "2026-05-20",
+                "pdf_link": "",
+            }
+        )
+        writer.writerow(
+            {
+                "supplier": "SupplierMerge",
+                "item_number": item["item_number"],
+                "quantity": "30",
+                "quotation_number": "Q-MERGE-001",
+                "issue_date": "2026-05-01",
+                "order_date": "2026-05-01",
+                "expected_arrival": "2026-05-25",
+                "pdf_link": "",
+            }
+        )
+
+    import_result = service.import_orders_from_csv_path(
+        conn,
+        supplier_name="SupplierMerge",
+        csv_path=csv_path,
+    )
+    assert import_result["status"] == "ok"
+    first_order_id = int(import_result["order_ids"][0])
+    second_order_id = int(import_result["order_ids"][1])
+
+    merged = service.merge_open_orders(
+        conn,
+        source_order_id=first_order_id,
+        target_order_id=second_order_id,
+        expected_arrival="2026-05-30",
+    )
+    assert merged["merged"] is True
+    assert merged["target_order"]["order_amount"] == 50
+    assert merged["target_order"]["expected_arrival"] == "2026-05-30"
+
+    lineage = service.list_order_lineage_events(conn, order_id=second_order_id)
+    assert any(
+        event["event_type"] == "ETA_MERGE"
+        and int(event["source_order_id"]) == first_order_id
+        and int(event["target_order_id"]) == second_order_id
+        for event in lineage
+    )
+
+    with csv_path.open("r", encoding="utf-8", newline="") as fp:
+        rows_after = list(csv.DictReader(fp))
+    assert len(rows_after) == 1
+    assert rows_after[0]["quantity"] == "50"
+    assert rows_after[0]["expected_arrival"] == "2026-05-30"
+
+
 def test_delete_quotation_rejects_if_any_linked_order_arrived(conn):
     item = _create_basic_item(conn, item_number="ARRIVE-GUARD-001")
     csv_content = "\n".join(

@@ -669,7 +669,9 @@ Projected Available =
 | Function | Purpose | Parameters |
 |----------|---------|------------|
 | `list_orders()` | Query orders with filters | status, supplier, include_arrived |
-| `update_order()` | Edit open order | order_id, expected_arrival, status |
+| `update_order()` | Edit open order or split partial ETA | order_id, expected_arrival, status, split_quantity |
+| `merge_open_orders()` | Merge two open split-compatible orders | source_order_id, target_order_id, expected_arrival |
+| `list_order_lineage_events()` | Retrieve split/merge lineage events for one order | order_id |
 | `list_quotations()` | Query quotations with filters | supplier |
 | `update_quotation()` | Edit quotation | quotation_id, issue_date, pdf_link |
 | `list_supplier_item_aliases()` | Query alias mappings | supplier |
@@ -684,6 +686,10 @@ Projected Available =
 **Constraints:**
 - Only non-Arrived orders can be updated
 - Open-order status remains `Ordered` (do not set `Arrived` via `update_order`)
+- `update_order` can split one open order into two open rows when `split_quantity` is provided together with a new `expected_arrival`
+- Split must be integer-safe for traceability quantities (`ordered_quantity`)
+- Merge is allowed only when open orders share `item_id`, `quotation_id`, and `ordered_item_number`
+- Split/merge updates must append lineage events for auditability
 - All quotations can be edited
 - Date fields must be YYYY-MM-DD format
 
@@ -816,7 +822,9 @@ Base URL: `http://localhost:8000/api`
 |--------|----------|-------------|
 | GET | `/orders` | List orders (supports `?status=`, `?supplier=`) |
 | GET | `/orders/{order_id}` | Get order details |
-| PUT | `/orders/{order_id}` | Update order |
+| PUT | `/orders/{order_id}` | Update order ETA (or split partial ETA via `split_quantity`) |
+| POST | `/orders/merge` | Merge two open compatible orders |
+| GET | `/orders/{order_id}/lineage` | List split/merge lineage events for the order |
 | POST | `/orders/import` | Import orders from CSV |
 | POST | `/orders/{order_id}/arrival` | Process order arrival |
 | POST | `/orders/{order_id}/partial-arrival` | Process partial arrival |

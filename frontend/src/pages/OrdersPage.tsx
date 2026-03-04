@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import useSWR from "swr";
 import { apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
-import type { MissingItemResolverRow, Order, Quotation } from "../lib/types";
+import type { Item, MissingItemResolverRow, Order, Quotation } from "../lib/types";
 
 const PENDING_MISSING_ITEMS_KEY = "mm.pending_missing_items";
 const PENDING_ORDER_IMPORT_KEY = "mm.pending_order_import";
@@ -151,6 +151,10 @@ export function OrdersPage() {
   const [quotationNumberSearch, setQuotationNumberSearch] = useState("");
   const [quotationFilter, setQuotationFilter] = useState("");
   const [isOrderListExpanded, setIsOrderListExpanded] = useState(false);
+  const [editingOrderId, setEditingOrderId] = useState<number | null>(null);
+  const [editingOrderExpectedArrival, setEditingOrderExpectedArrival] = useState("");
+  const [editingOrderSplitQuantity, setEditingOrderSplitQuantity] = useState("");
+  const [focusOrderId, setFocusOrderId] = useState<number | null>(null);
 
   const { data, error, isLoading, mutate: mutateOrders } = useSWR("/orders", () =>
     apiGetWithPagination<Order[]>("/orders?per_page=200")
@@ -161,6 +165,9 @@ export function OrdersPage() {
     isLoading: quotationsLoading,
     mutate: mutateQuotations,
   } = useSWR("/quotations", () => apiGetWithPagination<Quotation[]>("/quotations?per_page=200"));
+  const { data: itemsData } = useSWR("/items-orders-context", () =>
+    apiGetWithPagination<Item[]>("/items?per_page=500")
+  );
 
   const sortedOrders = useMemo(() => {
     const rows = [...(data?.data ?? [])];
@@ -208,6 +215,28 @@ export function OrdersPage() {
     });
     return rows;
   }, [quotationsData?.data, quotationFilter, quotationNumberSearch, quotationSortDirection, quotationSortKey]);
+
+  const itemByNumber = useMemo(() => {
+    return new Map((itemsData?.data ?? []).map((item) => [item.item_number, item]));
+  }, [itemsData?.data]);
+
+  const focusedOrder = useMemo(
+    () => sortedOrders.find((row) => row.order_id === focusOrderId) ?? null,
+    [focusOrderId, sortedOrders]
+  );
+
+  const focusedItem = focusedOrder ? itemByNumber.get(focusedOrder.canonical_item_number) ?? null : null;
+
+  const relatedOrders = useMemo(() => {
+    if (!focusedOrder) return [];
+    return sortedOrders.filter((row) => row.canonical_item_number === focusedOrder.canonical_item_number);
+  }, [focusedOrder, sortedOrders]);
+
+  const relatedQuotations = useMemo(() => {
+    if (!relatedOrders.length) return [];
+    const quotationNumbers = new Set(relatedOrders.map((row) => row.quotation_number));
+    return (quotationsData?.data ?? []).filter((row) => quotationNumbers.has(row.quotation_number));
+  }, [quotationsData?.data, relatedOrders]);
 
   function toggleSort(nextKey: typeof sortKey) {
     if (sortKey === nextKey) {
@@ -360,6 +389,44 @@ export function OrdersPage() {
       await Promise.all([mutateOrders(), mutateQuotations()]);
     } catch (error) {
       setMessage(`Delete failed: ${String(error ?? "")}`);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function beginEditOrder(row: Order) {
+    setEditingOrderId(row.order_id);
+    setEditingOrderExpectedArrival(row.expected_arrival ?? "");
+    setEditingOrderSplitQuantity("");
+  }
+
+  function cancelEditOrder() {
+    setEditingOrderId(null);
+    setEditingOrderExpectedArrival("");
+    setEditingOrderSplitQuantity("");
+  }
+
+  async function saveOrderEdit(orderId: number) {
+    setLoading(true);
+    try {
+      const splitQuantity = Number(editingOrderSplitQuantity);
+      const hasSplit = editingOrderSplitQuantity.trim().length > 0;
+      await apiSend(`/orders/${orderId}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          expected_arrival: editingOrderExpectedArrival.trim() || null,
+          split_quantity: hasSplit && Number.isFinite(splitQuantity) ? splitQuantity : null,
+        }),
+      });
+      setMessage(
+        hasSplit
+          ? `Split order #${orderId} and postponed ${splitQuantity} units to ${editingOrderExpectedArrival || "(no date)"}.`
+          : `Updated expected arrival for order #${orderId}.`
+      );
+      cancelEditOrder();
+      await Promise.all([mutateOrders(), mutateQuotations()]);
+    } catch (error) {
+      setMessage(`Order update failed: ${String(error ?? "")}`);
     } finally {
       setLoading(false);
     }
@@ -855,21 +922,74 @@ export function OrdersPage() {
                         <td className="px-2 py-2">{row.supplier_name}</td>
                         <td className="px-2 py-2 font-semibold">{row.canonical_item_number}</td>
                         <td className="px-2 py-2">{row.order_amount}</td>
-                        <td className="px-2 py-2">{row.expected_arrival ?? "-"}</td>
+                        <td className="px-2 py-2">
+                          {editingOrderId === row.order_id ? (
+                            <div className="space-y-2">
+                              <input
+                                className="input"
+                                type="date"
+                                value={editingOrderExpectedArrival}
+                                onChange={(event) => setEditingOrderExpectedArrival(event.target.value)}
+                              />
+                              <input
+                                className="input"
+                                type="number"
+                                min={1}
+                                max={row.order_amount - 1}
+                                placeholder={`Split qty (1-${row.order_amount - 1})`}
+                                value={editingOrderSplitQuantity}
+                                onChange={(event) => setEditingOrderSplitQuantity(event.target.value)}
+                              />
+                            </div>
+                          ) : (
+                            row.expected_arrival ?? "-"
+                          )}
+                        </td>
                         <td className="px-2 py-2">{row.status}</td>
                         <td className="px-2 py-2">
                           <div className="flex gap-2">
                             {row.status === "Ordered" ? (
-                              <button
-                                className="button-subtle"
-                                onClick={() => markArrived(row.order_id)}
-                                disabled={loading}
-                              >
-                                Mark Arrived
-                              </button>
+                              <>
+                                <button
+                                  className="button-subtle"
+                                  onClick={() => markArrived(row.order_id)}
+                                  disabled={loading}
+                                >
+                                  Mark Arrived
+                                </button>
+                                {editingOrderId === row.order_id ? (
+                                  <>
+                                    <button
+                                      className="button-subtle"
+                                      onClick={() => saveOrderEdit(row.order_id)}
+                                      disabled={loading}
+                                    >
+                                      Save ETA / Split
+                                    </button>
+                                    <button className="button-subtle" onClick={cancelEditOrder} disabled={loading}>
+                                      Cancel
+                                    </button>
+                                  </>
+                                ) : (
+                                  <button
+                                    className="button-subtle"
+                                    onClick={() => beginEditOrder(row)}
+                                    disabled={loading}
+                                  >
+                                    Edit ETA
+                                  </button>
+                                )}
+                              </>
                             ) : (
                               <span className="text-slate-400">-</span>
                             )}
+                            <button
+                              className="button-subtle"
+                              onClick={() => setFocusOrderId(row.order_id)}
+                              disabled={loading}
+                            >
+                              Details
+                            </button>
                             <button
                               className="button-subtle"
                               onClick={() => deleteOrder(row.order_id)}
@@ -887,6 +1007,83 @@ export function OrdersPage() {
               </div>
             )}
           </>
+        )}
+      </section>
+
+      <section className="panel p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <h2 className="font-display text-lg font-semibold">Order Context</h2>
+          {focusedOrder && (
+            <button type="button" className="button-subtle" onClick={() => setFocusOrderId(null)}>
+              Clear
+            </button>
+          )}
+        </div>
+        {!focusedOrder && (
+          <p className="text-sm text-slate-500">
+            Select <strong>Details</strong> from any order row to view item metadata, related arrivals, and quotation links
+            in one place. Use <strong>Edit ETA</strong> to change the entire order date, or enter <strong>Split qty</strong>
+            to postpone only part of an open order.
+          </p>
+        )}
+        {focusedOrder && (
+          <div className="space-y-3 text-sm">
+            <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+              <p>
+                <strong>Item:</strong> {focusedOrder.canonical_item_number}
+              </p>
+              <p>
+                <strong>Supplier:</strong> {focusedOrder.supplier_name} / <strong>Quotation:</strong>{" "}
+                {focusedOrder.quotation_number}
+              </p>
+              <p>
+                <strong>Expected arrival:</strong> {focusedOrder.expected_arrival ?? "-"}
+              </p>
+              <p>
+                <strong>Category:</strong> {focusedItem?.category ?? "-"} / <strong>Description:</strong>{" "}
+                {focusedItem?.description ?? "-"}
+              </p>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="min-w-full text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-slate-500">
+                    <th className="px-2 py-2">Order</th>
+                    <th className="px-2 py-2">Supplier</th>
+                    <th className="px-2 py-2">Qty</th>
+                    <th className="px-2 py-2">Expected</th>
+                    <th className="px-2 py-2">Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {relatedOrders.map((row) => (
+                    <tr key={`related-${row.order_id}`} className="border-b border-slate-100">
+                      <td className="px-2 py-2">#{row.order_id}</td>
+                      <td className="px-2 py-2">{row.supplier_name}</td>
+                      <td className="px-2 py-2">{row.order_amount}</td>
+                      <td className="px-2 py-2">{row.expected_arrival ?? "-"}</td>
+                      <td className="px-2 py-2">{row.status}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="space-y-1">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Related quotations</p>
+              {relatedQuotations.length ? (
+                relatedQuotations.map((row) => (
+                  <p key={`q-${row.quotation_id}`} className="text-sm text-slate-700">
+                    #{row.quotation_id} {row.quotation_number} ({row.supplier_name}) / issue: {row.issue_date ?? "-"}
+                    {row.pdf_link ? ` / ${row.pdf_link}` : ""}
+                  </p>
+                ))
+              ) : (
+                <p className="text-sm text-slate-500">No related quotation metadata loaded.</p>
+              )}
+            </div>
+          </div>
         )}
       </section>
 
