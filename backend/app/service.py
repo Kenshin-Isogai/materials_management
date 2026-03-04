@@ -5488,7 +5488,8 @@ def get_inventory_snapshot(
             im.item_id,
             im.item_number,
             m.name AS manufacturer_name,
-            COALESCE(ca.canonical_category, im.category) AS category
+            COALESCE(ca.canonical_category, im.category) AS category,
+            im.description
         FROM items_master im
         JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
         LEFT JOIN category_aliases ca ON ca.alias_category = im.category
@@ -5509,6 +5510,7 @@ def get_inventory_snapshot(
                 "item_number": item["item_number"] if item else None,
                 "manufacturer_name": item["manufacturer_name"] if item else None,
                 "category": item["category"] if item else None,
+                "description": item["description"] if item else None,
                 "location": location,
                 "quantity": quantity,
             }

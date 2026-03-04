@@ -77,9 +77,10 @@ Last updated: 2026-03-02 (JST)
 - Orders page `Order List` now supports inline editing of `expected_arrival` (ETA) for open orders, backed by `PUT /api/orders/{order_id}`.
 - ETA edit flow supports partial postponement using split quantity (e.g., postpone 30 of 50), which creates a second open-order row with the new ETA while preserving traceability-safe quantities.
 - Backend now persists split/merge/partial-arrival order lineage in `order_lineage_events`; API exposes `POST /api/orders/merge` and `GET /api/orders/{order_id}/lineage` for durable traceability and future scale-out reporting.
-- Snapshot page supports client-side quick search, location/category filtering, low-stock/shortage-only threshold filtering, and table-column sorting (item, location, quantity, category) to accelerate planning and purchase checks from projected inventory states.
+- Snapshot page supports client-side quick search, location/category filtering, low-stock/shortage-only threshold filtering, description-substring filtering, and table-column sorting (item, location, quantity, category) to accelerate planning and purchase checks from projected inventory states.
 - Orders page now also shows an `Imported Quotations` table sourced from `GET /api/quotations` (ID, supplier, quotation number, issue date, pdf_link) with client-side sorting and filtering controls.
 - Imported Quotations includes dedicated quotation-number search plus a secondary text filter for supplier/issue-date/PDF-link fields.
+- Imported Quotations now includes an `Orders` count column so each quotation row shows how many order rows currently reference that quotation.
 - Orders page mutation flows (manual import, unregistered batch steps, arrival processing) revalidate both orders and quotations datasets to avoid stale `Imported Quotations` content after successful operations.
 - Order List panel now starts collapsed and can be expanded/collapsed inline, reducing scroll distance to the `Imported Quotations` section when reviewing quotations.
 - Orders page includes an `Order Context` panel (row-level Details action) that consolidates item metadata, related order arrivals, and related quotation metadata to reduce cross-tab lookup overhead.
