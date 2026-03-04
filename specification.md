@@ -964,7 +964,7 @@ Base URL: `http://localhost:8000/api`
 | item_number | Yes | String |
 | supplier | Yes | String |
 | manufacturer_name | No | String (used for `new_item`; defaults to `UNKNOWN` when blank; accepts alias header `manufacturer`) |
-| resolution_type | No | `new_item` (default) or `alias` |
+| resolution_type | No | `new_item` (default) or `alias` (alias header: `row_type`; value `item` is treated as `new_item`) |
 | category | No | String (used for `new_item`; optional in current app) |
 | url | No | URL |
 | description | No | String |

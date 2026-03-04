@@ -8,6 +8,10 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 ### Changed
 
+- Missing-item registration compatibility update:
+  - Clarified contract/docs that `resolution_type` is canonical, while legacy `row_type` remains accepted as an alias in row payloads.
+  - Backend request schema now normalizes `row_type=item` to `resolution_type=new_item` for `POST /api/register-missing/rows`.
+
 - Orders reliability/scalability upgrade (Phase 2):
   - Added durable lineage storage table `order_lineage_events` to persist split/merge/arrival lineage events with timestamped metadata.
   - Added `POST /api/orders/merge` to merge two compatible open rows (`item_id`, `quotation_id`, `ordered_item_number`) into one open row while preserving CSV/DB consistency.

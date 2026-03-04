@@ -298,6 +298,7 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 - Batch consolidation uses collision-safe temporary per-file register naming (supplier-prefixed) and deletes temporary files only after consolidated-register write succeeds.
 - Consolidated register files may include rows from multiple suppliers; archive move in missing-item registration uses `registered/csv_files/UNKNOWN/` while preserving row-level supplier columns.
 - In `missing_items_registration.csv`, `supplier` means the supplier alias namespace for ordered SKU resolution. `new_item` rows may optionally provide `manufacturer_name` (or `manufacturer`); blank values default to `UNKNOWN`.
+- Registration inputs accept both `resolution_type` (`new_item`/`alias`) and legacy `row_type` (`item`/`alias`) to avoid mixed-template confusion; `row_type=item` is normalized to `resolution_type=new_item`.
 - Manual and batch order imports reject quotations already imported for the same supplier (same `quotation_number` with existing orders), returning a conflict to avoid duplicate order ingestion.
 - Per-file unregistered import must keep filesystem moves atomic: if any move fails, rollback already moved files for that CSV and return file-level error.
 - File collisions are handled by non-destructive renaming (`_1`, `_2`, ...).

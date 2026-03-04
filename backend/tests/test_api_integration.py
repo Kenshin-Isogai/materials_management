@@ -1115,6 +1115,33 @@ def test_register_missing_rows_endpoint_accepts_manufacturer_alias_field(client)
     assert len(rows) == 1
     assert rows[0]["manufacturer_name"] == "RESOLVER-MFG-ALIAS"
 
+
+def test_register_missing_rows_endpoint_accepts_legacy_row_type_item(client):
+    response = client.post(
+        "/api/register-missing/rows",
+        json={
+            "rows": [
+                {
+                    "supplier": "SupplierResolver",
+                    "item_number": "MISS-ITEM-ROW-TYPE",
+                    "row_type": "item",
+                    "manufacturer_name": "ROW-TYPE-MFG",
+                    "category": "Lens",
+                    "description": "legacy row_type mapping",
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["created_items"] == 1
+
+    items = client.get("/api/items?q=MISS-ITEM-ROW-TYPE&per_page=50")
+    assert items.status_code == 200
+    rows = items.json()["data"]
+    assert len(rows) == 1
+    assert rows[0]["manufacturer_name"] == "ROW-TYPE-MFG"
+
 def test_register_missing_rows_endpoint_rejects_unresolved_new_item(client):
     response = client.post(
         "/api/register-missing/rows",
