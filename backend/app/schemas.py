@@ -123,12 +123,26 @@ class MissingItemRegistrationRow(BaseModel):
         default=None,
         validation_alias=AliasChoices("manufacturer_name", "manufacturer"),
     )
-    resolution_type: Literal["new_item", "alias"] = "new_item"
+    resolution_type: Literal["new_item", "alias"] = Field(
+        default="new_item",
+        validation_alias=AliasChoices("resolution_type", "row_type"),
+    )
     category: str | None = None
     url: str | None = None
     description: str | None = None
     canonical_item_number: str | None = None
     units_per_order: int | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_resolution_type_alias(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        raw = str(normalized.get("resolution_type") or normalized.get("row_type") or "").strip().lower()
+        if raw == "item":
+            normalized["resolution_type"] = "new_item"
+        return normalized
 
 
 class MissingItemRegistrationRequest(BaseModel):
