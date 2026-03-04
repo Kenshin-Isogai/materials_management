@@ -4,6 +4,22 @@ This file tracks meaningful changes to code, behavior, and documentation.
 
 Format style: Keep a simple date-based log while repository versioning policy is being finalized.
 
+## 2026-03-04
+
+### Changed
+
+- Orders reliability/scalability upgrade (Phase 2):
+  - Added durable lineage storage table `order_lineage_events` to persist split/merge/arrival lineage events with timestamped metadata.
+  - Added `POST /api/orders/merge` to merge two compatible open rows (`item_id`, `quotation_id`, `ordered_item_number`) into one open row while preserving CSV/DB consistency.
+  - Added `GET /api/orders/{order_id}/lineage` so traceability views and audits can consume persisted lineage instead of inferring from mutable order rows.
+  - Extended split ETA update flow to append lineage events and hardened validation (`split_quantity` must be integer, positive, and split-safe).
+  - Added backend API/service regression coverage for merge + lineage behavior.
+
+### Tests
+
+- Backend test suite executed with `uv run python -m pytest`.
+- Frontend production build executed successfully.
+
 ## 2026-03-02
 
 ### Changed
@@ -245,3 +261,17 @@ Format style: Keep a simple date-based log while repository versioning policy is
 
 - Assembly feature is now used directly in reservation CSV import by expanding assembly rows to component reservation rows, improving workflow efficiency without turning assemblies into enforced inventory constraints.
 - CSV movement/reservation imports now convert non-numeric numeric fields (`item_id`, `quantity`, `project_id`, `assembly_quantity`) into `AppError` validation responses (`422`) instead of surfacing unhandled `ValueError` as internal errors.
+
+## 2026-03-04 (CSV sibling-order bug fixes for split/merge)
+
+### Fixed
+
+- Fixed merge CSV synchronization to compute source/target sibling occurrence matchers before deleting source DB row, and adjusted target occurrence handling when source precedes target so merged quantity/ETA updates apply to the correct CSV row.
+- Fixed split CSV insertion ordering so newly created split rows are appended after the existing sibling block (order-id occurrence order), preventing row-identity drift when splitting a non-final sibling row.
+
+### Tests
+
+- Backend test suite executed successfully: `73 passed`.
+- Added targeted regression coverage for:
+  - merging non-first sibling rows without deleting/updating the wrong CSV entry
+  - splitting a non-final sibling row while preserving sibling-block row order in CSV

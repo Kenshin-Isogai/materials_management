@@ -93,6 +93,13 @@ class ReservationImportRequest(BaseModel):
 class OrderUpdateRequest(BaseModel):
     expected_arrival: str | None = None
     status: Literal["Ordered"] | None = None
+    split_quantity: int | None = None
+
+
+class OrderMergeRequest(BaseModel):
+    source_order_id: int
+    target_order_id: int
+    expected_arrival: str | None = None
 
 
 class UnregisteredBatchRequest(BaseModel):

@@ -369,10 +369,14 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 ### Order/quotation correction operations (UI + consistency)
 
 - Correction endpoints:
+  - `PUT /api/orders/{order_id}` updates open-order expected arrival metadata (`expected_arrival`) and supports partial ETA postponement via `split_quantity` (integer-safe split creates a second open order row).
+  - `POST /api/orders/merge` merges two open split-compatible rows and appends lineage metadata.
+  - `GET /api/orders/{order_id}/lineage` returns split/merge/arrival lineage events for traceability views and audits.
   - `PUT /api/quotations/{quotation_id}` updates quotation metadata.
   - `DELETE /api/orders/{order_id}` deletes open (non-arrived) orders.
   - `DELETE /api/quotations/{quotation_id}` deletes quotation and linked orders only when no linked order is already arrived.
-- Consistency rule: when these operations mutate DB rows, matching order CSV records are rewritten/removed so CSV source files and database state do not diverge.
+- Consistency rule: when these operations mutate DB rows, matching order CSV records are rewritten/inserted/removed so CSV source files and database state do not diverge.
+- Reliability/scalability posture: order split/merge transitions are persisted in `order_lineage_events` so future analytics/audit screens can read durable lineage without inferring history from mutable order rows.
 - CSV row identity rule for order-level maintenance: `update_order`/`delete_order` must target exactly one CSV row by order identity (including duplicate `(supplier, quotation_number, item_number)` occurrences) to prevent fan-out edits/deletes when a quotation contains repeated item rows.
 
 
