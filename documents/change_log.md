@@ -1,3 +1,15 @@
+## 2026-03-05
+
+### Changed
+
+- Frontend reservation/planning UX clarification:
+  - Renamed navigation label from `Reserve` to `Reservations`.
+  - Reservations page title/help text now explicitly distinguishes execution-time reservations from project planning.
+  - Projects page help text now explicitly positions Projects as future-demand planning before reservation execution.
+- Reservations page entry workflow simplification:
+  - Removed the separate `Single Reservation` form.
+  - Expanded the table-based reservation entry section (single + batch in one place) and increased default row count for faster multi-line input.
+
 # Change Log
 
 This file tracks meaningful changes to code, behavior, and documentation.
