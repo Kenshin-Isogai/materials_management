@@ -14,6 +14,12 @@ This document explains the implemented architecture of the Materials Management 
 
 ## Software Architecture
 
+### Projects planning UX notes (frontend)
+
+- The Projects page supports requirement target lookup via searchable item input (`datalist`) so users can select from large item registries faster than scrolling long select lists.
+- Requirement entry includes a bulk text parser (`item_number,quantity` per line) that maps known item numbers to registered items and flags unmatched rows as unregistered.
+- Existing projects can be loaded into the same form for edit/save flows (`GET /api/projects/{id}` then `PUT /api/projects/{id}`), including requirement composition updates.
+
 ### High-level Architecture (Mermaid)
 
 ```mermaid
