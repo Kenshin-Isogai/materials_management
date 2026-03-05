@@ -7,6 +7,13 @@
   - Added bulk requirement text parser (`item_number,quantity` per line) that auto-maps registered items and warns on unregistered item numbers.
   - Added project edit workflow in Projects page (load existing project, update requirement rows/quantities/types, save via update API).
 
+### Fixed
+
+- Projects requirement bulk parser now disambiguates duplicate `item_number` values across manufacturers.
+  - Duplicate matches are marked as ambiguous/unregistered instead of silently binding to an arbitrary `item_id`.
+- Projects requirement free-text `#<id>` parsing now validates parsed IDs against loaded item/assembly options before marking rows as matched.
+  - Invalid or unknown IDs remain unregistered client-side, preventing avoidable backend foreign-key errors on save.
+
 - Frontend reservation/planning UX clarification:
   - Renamed navigation label from `Reserve` to `Reservations`.
   - Reservations page title/help text now explicitly distinguishes execution-time reservations from project planning.

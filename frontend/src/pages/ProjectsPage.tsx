@@ -74,10 +74,18 @@ export function ProjectsPage() {
   );
   const items = itemsResp?.data ?? [];
   const assemblies = assembliesResp?.data ?? [];
-  const itemLookupByNumber = useMemo(
-    () => new Map(items.map((item) => [item.item_number.trim().toLowerCase(), item])),
-    [items]
-  );
+  const itemLookupByNumber = useMemo(() => {
+    const lookup = new Map<string, Item[]>();
+    for (const item of items) {
+      const key = item.item_number.trim().toLowerCase();
+      const current = lookup.get(key) ?? [];
+      current.push(item);
+      lookup.set(key, current);
+    }
+    return lookup;
+  }, [items]);
+  const itemIds = useMemo(() => new Set(items.map((item) => item.item_id)), [items]);
+  const assemblyIds = useMemo(() => new Set(assemblies.map((assembly) => assembly.assembly_id)), [assemblies]);
 
   const itemSearchOptions = useMemo(
     () =>
@@ -98,7 +106,9 @@ export function ProjectsPage() {
 
   function updateRequirementTargetFromText(index: number, targetType: RequirementRow["target_type"], text: string) {
     const parsedId = Number((text.split("#").pop() ?? "").trim());
-    if (!Number.isNaN(parsedId) && parsedId > 0) {
+    const isKnownTarget =
+      targetType === "ITEM" ? itemIds.has(parsedId) : assemblyIds.has(parsedId);
+    if (!Number.isNaN(parsedId) && parsedId > 0 && isKnownTarget) {
       updateRequirement(index, {
         target_type: targetType,
         target_id: String(parsedId),
@@ -224,8 +234,8 @@ export function ProjectsPage() {
       .map((line) => {
         const [itemNumberRaw, quantityRaw] = line.split(",").map((part) => part.trim());
         const quantity = Number(quantityRaw || "1");
-        const matchedItem = itemLookupByNumber.get(itemNumberRaw.toLowerCase());
-        if (!matchedItem) {
+        const matchedItems = itemLookupByNumber.get(itemNumberRaw.toLowerCase()) ?? [];
+        if (matchedItems.length === 0) {
           warnings.push(`Unregistered item: ${itemNumberRaw}`);
           return {
             ...blankRequirement(),
@@ -235,6 +245,17 @@ export function ProjectsPage() {
             match_status: "unregistered" as const
           };
         }
+        if (matchedItems.length > 1) {
+          warnings.push(`Ambiguous item number (multiple manufacturers): ${itemNumberRaw}`);
+          return {
+            ...blankRequirement(),
+            target_type: "ITEM" as const,
+            target_query: itemNumberRaw,
+            quantity: String(Number.isFinite(quantity) && quantity > 0 ? quantity : 1),
+            match_status: "unregistered" as const
+          };
+        }
+        const matchedItem = matchedItems[0];
         return {
           ...blankRequirement(),
           target_type: "ITEM" as const,
