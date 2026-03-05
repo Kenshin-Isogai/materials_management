@@ -114,7 +114,10 @@ export function ProjectsPage() {
       <section>
         <h1 className="font-display text-3xl font-bold">Projects</h1>
         <p className="mt-1 text-sm text-slate-600">
-          Register future demand and reserve available inventory for project requirements.
+          Plan future demand and requirement structure before execution-time reservations.
+        </p>
+        <p className="mt-1 text-xs text-slate-500">
+          Use <span className="font-semibold">Reservations</span> to allocate concrete quantities when work is ready to run.
         </p>
       </section>
 

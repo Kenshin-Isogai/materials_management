@@ -20,8 +20,12 @@ const blankRow = (): ReservationRow => ({
 });
 
 export function ReservationsPage() {
-  const [form, setForm] = useState<ReservationRow>(blankRow());
-  const [bulkRows, setBulkRows] = useState<ReservationRow[]>([blankRow(), blankRow()]);
+  const [bulkRows, setBulkRows] = useState<ReservationRow[]>([
+    blankRow(),
+    blankRow(),
+    blankRow(),
+    blankRow()
+  ]);
   const [loading, setLoading] = useState(false);
   const [reservationCsvFile, setReservationCsvFile] = useState<File | null>(null);
   const { data, error, isLoading, mutate } = useSWR("/reservations", () =>
@@ -34,27 +38,6 @@ export function ReservationsPage() {
 
   function itemLabel(item: Item) {
     return `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`;
-  }
-
-  async function createOne(event: FormEvent) {
-    event.preventDefault();
-    setLoading(true);
-    try {
-      await apiSend("/reservations", {
-        method: "POST",
-        body: JSON.stringify({
-          item_id: Number(form.item_id),
-          quantity: Number(form.quantity),
-          purpose: form.purpose || null,
-          deadline: form.deadline || null,
-          note: form.note || null
-        })
-      });
-      setForm((prev) => ({ ...prev, quantity: "", purpose: "", note: "" }));
-      await mutate();
-    } finally {
-      setLoading(false);
-    }
   }
 
   function updateBulkRow(index: number, patch: Partial<ReservationRow>) {
@@ -82,7 +65,7 @@ export function ReservationsPage() {
         method: "POST",
         body: JSON.stringify({ reservations })
       });
-      setBulkRows([blankRow(), blankRow()]);
+      setBulkRows([blankRow(), blankRow(), blankRow(), blankRow()]);
       await mutate();
     } finally {
       setLoading(false);
@@ -163,9 +146,13 @@ export function ReservationsPage() {
   return (
     <div className="space-y-6">
       <section>
-        <h1 className="font-display text-3xl font-bold">Reserve</h1>
+        <h1 className="font-display text-3xl font-bold">Reservations</h1>
         <p className="mt-1 text-sm text-slate-600">
-          Reserve stock for future use and handle release or consume transitions.
+          Reserve stock for near-term execution and handle release or consume transitions.
+        </p>
+        <p className="mt-1 text-xs text-slate-500">
+          Use <span className="font-semibold">Projects</span> for demand planning first, then reserve
+          concrete quantities here once work is ready.
         </p>
       </section>
 
@@ -190,57 +177,9 @@ export function ReservationsPage() {
         </form>
       </section>
 
-      <section className="grid gap-5 lg:grid-cols-2">
-        <form className="panel grid gap-3 p-4" onSubmit={createOne}>
-          <h2 className="font-display text-lg font-semibold">Single Reservation</h2>
-          <select
-            className="input"
-            value={form.item_id}
-            onChange={(e) => setForm((p) => ({ ...p, item_id: e.target.value }))}
-            required
-          >
-            <option value="">Select item</option>
-            {items.map((item) => (
-              <option key={item.item_id} value={item.item_id}>
-                {itemLabel(item)}
-              </option>
-            ))}
-          </select>
-          <input
-            className="input"
-            placeholder="Quantity"
-            type="number"
-            min={1}
-            value={form.quantity}
-            onChange={(e) => setForm((p) => ({ ...p, quantity: e.target.value }))}
-            required
-          />
-          <input
-            className="input"
-            placeholder="Purpose"
-            value={form.purpose}
-            onChange={(e) => setForm((p) => ({ ...p, purpose: e.target.value }))}
-          />
-          <input
-            className="input"
-            type="date"
-            value={form.deadline}
-            onChange={(e) => setForm((p) => ({ ...p, deadline: e.target.value }))}
-          />
-          <input
-            className="input"
-            placeholder="Note"
-            value={form.note}
-            onChange={(e) => setForm((p) => ({ ...p, note: e.target.value }))}
-          />
-          <button className="button" disabled={loading} type="submit">
-            Reserve
-          </button>
-        </form>
-
-        <div className="panel space-y-3 p-4">
+      <section className="panel space-y-3 p-4">
           <div className="flex items-center justify-between">
-            <h2 className="font-display text-lg font-semibold">Bulk Reservation Entry</h2>
+            <h2 className="font-display text-lg font-semibold">Reservation Entry</h2>
             <button
               className="button-subtle"
               onClick={() => setBulkRows((prev) => [...prev, blankRow()])}
@@ -248,8 +187,11 @@ export function ReservationsPage() {
               Add Row
             </button>
           </div>
+          <p className="text-xs text-slate-500">
+            Single-item and multi-item reservations are both handled here.
+          </p>
           <div className="overflow-x-auto">
-            <table className="min-w-[900px] text-sm">
+            <table className="min-w-full text-sm">
               <thead>
                 <tr className="border-b border-slate-200 text-left text-slate-500">
                   <th className="px-2 py-2">Item</th>
@@ -321,7 +263,6 @@ export function ReservationsPage() {
           <button className="button" disabled={loading} onClick={createBulk}>
             Submit Batch
           </button>
-        </div>
       </section>
 
       <section className="panel p-4">

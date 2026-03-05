@@ -5,7 +5,7 @@ const nav = [
   { to: "/items", label: "Items" },
   { to: "/inventory", label: "Movements" },
   { to: "/orders", label: "Orders" },
-  { to: "/reservations", label: "Reserve" },
+  { to: "/reservations", label: "Reservations" },
   { to: "/assemblies", label: "Assemblies" },
   { to: "/projects", label: "Projects" },
   { to: "/bom", label: "BOM" },

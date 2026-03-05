@@ -73,6 +73,8 @@ Last updated: 2026-03-04 (JST)
 - SPA navigation is implemented with React Router via `AppShell`.
 - Data fetching is SWR-based with typed API client wrappers.
 - Reservations page supports partial release/consume via quantity prompt.
+- Reservations page now uses a single expanded `Reservation Entry` table for both one-off and multi-row reservation creation (the separate `Single Reservation` form was removed).
+- Reservations and Projects page headers now include guidance clarifying scope: Reservations is execution-time allocation, Projects is future-demand planning.
 - Orders page `Order List` supports client-side sorting by order id, supplier, item, quantity, expected arrival, and status.
 - Orders page `Order List` now supports inline editing of `expected_arrival` (ETA) for open orders, backed by `PUT /api/orders/{order_id}`.
 - ETA edit flow supports partial postponement using split quantity (e.g., postpone 30 of 50), which creates a second open-order row with the new ETA while preserving traceability-safe quantities.
