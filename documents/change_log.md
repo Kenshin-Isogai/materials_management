@@ -36,6 +36,7 @@
 - Prevented misleading historical BOM projections by rejecting past `target_date` values for BOM analysis.
   - `target_date < today` now returns `422` with `INVALID_TARGET_DATE`.
 - Prevented misleading historical project-gap projections by rejecting past `target_date` values in project gap analysis (`422`, `INVALID_TARGET_DATE`).
+- BOM page `Save Shortages` now catches API failures and surfaces a user-visible error message instead of failing silently.
 - Item deletion/update reference detection now includes `purchase_candidates`.
   - Deleting an item referenced by a purchase candidate now returns controlled domain/API error handling (`ITEM_REFERENCED`) instead of bubbling raw SQLite FK errors.
 

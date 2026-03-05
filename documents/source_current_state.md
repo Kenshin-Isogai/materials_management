@@ -83,6 +83,7 @@ Last updated: 2026-03-05 (JST)
 - Projects page now supports editing an existing project (load details into form, then save via project update API) including requirement composition/quantities.
 - BOM page now supports optional analysis date input and sends `target_date` to `POST /api/bom/analyze` for future-arrival-aware gap checks.
 - BOM page now supports `Save Shortages` to persist shortage/missing rows as purchase candidates before PO creation.
+- BOM page `Save Shortages` now surfaces API errors in-page (message area) instead of failing silently on rejected inputs such as past `target_date`.
 - Purchase Candidates page provides persistent shortage tracking with status transitions (`OPEN`, `ORDERING`, `ORDERED`, `CANCELLED`) and project-gap candidate creation.
 - Orders page `Order List` supports client-side sorting by order id, supplier, item, quantity, expected arrival, and status.
 - Orders page `Order List` now supports inline editing of `expected_arrival` (ETA) for open orders, backed by `PUT /api/orders/{order_id}`.

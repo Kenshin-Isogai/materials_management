@@ -105,6 +105,8 @@ export function BomPage() {
       });
       setResult({ rows: data.analysis, target_date: data.target_date });
       setMessage(`Saved ${data.created_count} purchase candidate(s).`);
+    } catch (e) {
+      setMessage(`Save failed: ${String(e ?? "")}`);
     } finally {
       setLoading(false);
     }
