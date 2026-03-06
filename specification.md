@@ -599,6 +599,7 @@ Maps raw category names to canonical category names for soft-merge behavior.
    - surface duplicate quotation conflicts before commit without creating a supplier during preview
 3. Preview confirmation may send optional per-row `row_overrides` (`item_id`, `units_per_order`)
    plus optional `alias_saves` for reusable supplier-scoped ordered names
+   - preview-confirmation JSON fields are strict: malformed JSON, wrong top-level types, missing required keys, unsupported fields, and row numbers not present in the uploaded CSV must return `422`, never `5xx`
 4. System resolves each CSV `item_number`:
    - direct match in `items_master`, or
    - alias match in `supplier_item_aliases` (`ordered_item_number -> canonical_item_id`)
@@ -821,6 +822,10 @@ Projected Available =
 - Reservation preview:
   - `POST /reservations/import-preview` validates direct item or assembly targets, previews assembly expansion, and flags inventory shortages before commit
   - preview confirmation may send optional per-row `row_overrides` (`item_id` or `assembly_id`) to `POST /reservations/import-csv`; the override target is authoritative during commit, even if the raw CSV row still contains a stale item or assembly field
+- All preview-confirmation multipart JSON fields (`row_overrides`, `alias_saves`) are strict contracts:
+  - malformed JSON returns `422 INVALID_REQUEST`
+  - wrong top-level JSON shape, missing required keys, unsupported fields, and row numbers not present in the uploaded CSV return flow-specific `422` errors
+  - these validation failures must not bubble as `5xx`
 - Reservation CSV import supports either direct `item_id` reservations or assembly-driven rows (`assembly` + optional `assembly_quantity`) that expand to component reservations using assembly definitions.
 - Assembly expansion is intentionally advisory/planning-oriented (no automatic inventory movement beyond reservation allocation), which aligns with current assembly policy and avoids unnecessary complexity.
 - Items, inventory, orders, and reservations CSV workflows each expose:
@@ -943,7 +948,7 @@ Base URL: `http://localhost:8000/api`
 | GET | `/items/import-template` | Download header-only item import template CSV (UTF-8 with BOM) |
 | GET | `/items/import-reference` | Download live item/alias reference CSV |
 | POST | `/items/import-preview` | Preview item/alias CSV reconciliation before commit |
-| POST | `/items/import` | Import items and supplier-scoped aliases from CSV; accepts optional preview-confirmation `row_overrides` (`canonical_item_number`, `units_per_order`) |
+| POST | `/items/import` | Import items and supplier-scoped aliases from CSV; accepts optional preview-confirmation `row_overrides` (`canonical_item_number`, `units_per_order`) with strict `422` validation for malformed or invalid override payloads |
 | GET | `/items/{item_id}` | Get item details |
 | POST | `/items` | Create item |
 | PUT | `/items/{item_id}` | Update item |
@@ -964,7 +969,7 @@ Base URL: `http://localhost:8000/api`
 | POST | `/inventory/consume` | Consume items from location |
 | POST | `/inventory/adjust` | Adjust inventory quantity |
 | POST | `/inventory/batch` | Batch movement operations |
-| POST | `/inventory/import-csv` | Import movement operations from CSV; accepts optional preview-confirmation `row_overrides` (`item_id`) |
+| POST | `/inventory/import-csv` | Import movement operations from CSV; accepts optional preview-confirmation `row_overrides` (`item_id`) with strict `422` validation for malformed or invalid override payloads |
 
 #### **Orders & Quotations**
 
@@ -978,7 +983,7 @@ Base URL: `http://localhost:8000/api`
 | PUT | `/orders/{order_id}` | Update order ETA, project assignment for non-RFQ-managed orders, or split partial ETA via `split_quantity` |
 | POST | `/orders/merge` | Merge two open compatible orders |
 | GET | `/orders/{order_id}/lineage` | List split/merge lineage events for the order |
-| POST | `/orders/import` | Import orders from CSV; accepts optional preview-confirmation `row_overrides` and `alias_saves` form fields |
+| POST | `/orders/import` | Import orders from CSV; accepts optional preview-confirmation `row_overrides` and `alias_saves` form fields with strict `422` validation for malformed or invalid payloads |
 | POST | `/orders/{order_id}/arrival` | Process order arrival |
 | POST | `/orders/{order_id}/partial-arrival` | Process partial arrival |
 | GET | `/quotations` | List quotations |
@@ -997,7 +1002,7 @@ Base URL: `http://localhost:8000/api`
 | POST | `/reservations/{reservation_id}/release` | Release reservation (full or partial using optional `quantity`) |
 | POST | `/reservations/{reservation_id}/consume` | Consume reservation (full or partial using optional `quantity`) |
 | POST | `/reservations/batch` | Batch create reservations |
-| POST | `/reservations/import-csv` | Import reservation rows from CSV; accepts optional preview-confirmation `row_overrides` (`item_id` or `assembly_id`) |
+| POST | `/reservations/import-csv` | Import reservation rows from CSV; accepts optional preview-confirmation `row_overrides` (`item_id` or `assembly_id`) with strict `422` validation for malformed or invalid override payloads |
 
 #### **Assemblies**
 

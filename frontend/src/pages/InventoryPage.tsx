@@ -2,6 +2,7 @@ import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { CatalogPicker } from "../components/CatalogPicker";
 import { apiDownload, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type { CatalogSearchResult, InventoryRow, Item } from "../lib/types";
 
 type MoveForm = {
@@ -114,7 +115,7 @@ export function InventoryPage() {
   }
 
   function selectedMovementPreviewMatch(row: InventoryImportPreviewRow): CatalogSearchResult | null {
-    return movementPreviewSelections[row.row] ?? row.suggested_match ?? null;
+    return resolvePreviewSelection(movementPreviewSelections, row.row, row.suggested_match ?? null);
   }
 
   function previewStatusTone(status: InventoryImportPreviewRow["status"]): string {
@@ -151,6 +152,8 @@ export function InventoryPage() {
           ? `Preview ready: ${result.summary.total_rows} row(s) are ready to import.`
           : `Preview ready: review=${result.summary.needs_review}, unresolved=${result.summary.unresolved}.`
       );
+    } catch (error) {
+      setMovementMessage(formatActionError("Preview failed", error));
     } finally {
       setIsSubmitting(false);
     }
@@ -203,6 +206,8 @@ export function InventoryPage() {
       setMovementBatchId("");
       resetMovementPreview();
       await mutate();
+    } catch (error) {
+      setMovementMessage(formatActionError("Import failed", error));
     } finally {
       setIsSubmitting(false);
     }

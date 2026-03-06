@@ -52,6 +52,74 @@ def _rows_to_dict(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _require_json_object(
+    value: Any,
+    *,
+    code: str,
+    label: str,
+) -> dict[str | int, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise AppError(
+            code=code,
+            message=f"{label} must be a JSON object keyed by CSV row number",
+            status_code=422,
+        )
+    return value
+
+
+def _require_json_array(
+    value: Any,
+    *,
+    code: str,
+    label: str,
+) -> list[Any]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise AppError(
+            code=code,
+            message=f"{label} must be a JSON array",
+            status_code=422,
+        )
+    return value
+
+
+def _csv_row_has_content(row: dict[str, Any]) -> bool:
+    return any(str(value or "").strip() for value in row.values())
+
+
+def _valid_csv_row_numbers(
+    rows: list[dict[str, Any]],
+    *,
+    skip_blank_rows: bool = False,
+) -> set[int]:
+    valid_row_numbers: set[int] = set()
+    for row_number, row in enumerate(rows, start=2):
+        if skip_blank_rows and not _csv_row_has_content(row):
+            continue
+        valid_row_numbers.add(row_number)
+    return valid_row_numbers
+
+
+def _validate_import_override_rows(
+    overrides: dict[int, Any],
+    *,
+    valid_row_numbers: set[int],
+    code: str,
+    label: str,
+) -> None:
+    invalid_rows = sorted(set(overrides) - valid_row_numbers)
+    if invalid_rows:
+        invalid_rows_text = ", ".join(str(row_number) for row_number in invalid_rows)
+        raise AppError(
+            code=code,
+            message=f"{label} references row(s) not present in the uploaded CSV: {invalid_rows_text}",
+            status_code=422,
+        )
+
+
 def _paginate(
     conn: sqlite3.Connection,
     sql: str,
@@ -1398,7 +1466,12 @@ def _normalize_items_import_overrides(
     row_overrides: dict[str | int, Any] | None,
 ) -> dict[int, dict[str, Any]]:
     normalized: dict[int, dict[str, Any]] = {}
-    for raw_row_number, raw_override in (row_overrides or {}).items():
+    override_payload = _require_json_object(
+        row_overrides,
+        code="INVALID_ITEM_IMPORT_OVERRIDE",
+        label="Item import row_overrides",
+    )
+    for raw_row_number, raw_override in override_payload.items():
         try:
             row_number = int(raw_row_number)
         except Exception as exc:  # noqa: BLE001
@@ -1420,10 +1493,32 @@ def _normalize_items_import_overrides(
                 status_code=422,
             )
         override: dict[str, Any] = {}
-        canonical_item_number = str(raw_override.get("canonical_item_number") or "").strip()
-        if canonical_item_number:
+        unexpected_fields = sorted(set(raw_override) - {"canonical_item_number", "units_per_order"})
+        if unexpected_fields:
+            raise AppError(
+                code="INVALID_ITEM_IMPORT_OVERRIDE",
+                message=(
+                    f"Item import override for row {row_number} has unsupported field(s): "
+                    f"{', '.join(unexpected_fields)}"
+                ),
+                status_code=422,
+            )
+        if "canonical_item_number" in raw_override:
+            canonical_item_number = str(raw_override.get("canonical_item_number") or "").strip()
+            if not canonical_item_number:
+                raise AppError(
+                    code="INVALID_ITEM_IMPORT_OVERRIDE",
+                    message=f"canonical_item_number override must be a non-empty string (row {row_number})",
+                    status_code=422,
+                )
             override["canonical_item_number"] = canonical_item_number
-        if raw_override.get("units_per_order") not in (None, ""):
+        if "units_per_order" in raw_override:
+            if raw_override.get("units_per_order") in (None, ""):
+                raise AppError(
+                    code="INVALID_ITEM_IMPORT_OVERRIDE",
+                    message=f"units_per_order override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                )
             try:
                 override["units_per_order"] = require_positive_int(
                     int(raw_override["units_per_order"]),
@@ -1435,8 +1530,16 @@ def _normalize_items_import_overrides(
                     message=f"units_per_order override must be an integer > 0 (row {row_number})",
                     status_code=422,
                 ) from exc
-        if override:
-            normalized[row_number] = override
+        if not override:
+            raise AppError(
+                code="INVALID_ITEM_IMPORT_OVERRIDE",
+                message=(
+                    f"Item import override for row {row_number} must include "
+                    "canonical_item_number or units_per_order"
+                ),
+                status_code=422,
+            )
+        normalized[row_number] = override
     return normalized
 
 
@@ -1831,11 +1934,17 @@ def import_items_from_rows(
     report: list[dict[str, Any]] = []
     deferred_aliases: list[dict[str, Any]] = []
     normalized_overrides = _normalize_items_import_overrides(row_overrides)
+    _validate_import_override_rows(
+        normalized_overrides,
+        valid_row_numbers=_valid_csv_row_numbers(rows, skip_blank_rows=True),
+        code="INVALID_ITEM_IMPORT_OVERRIDE",
+        label="Item import row_overrides",
+    )
 
     csv_item_numbers = {
         (row.get("item_number") or "").strip()
         for row in rows
-        if any(str(value or "").strip() for value in row.values())
+        if _csv_row_has_content(row)
         and _normalize_item_import_row_type(row) == "item"
         and (row.get("item_number") or "").strip()
     }
@@ -3124,7 +3233,12 @@ def _normalize_inventory_import_overrides(
     row_overrides: dict[str | int, Any] | None,
 ) -> dict[int, dict[str, int]]:
     normalized: dict[int, dict[str, int]] = {}
-    for raw_row_number, raw_override in (row_overrides or {}).items():
+    override_payload = _require_json_object(
+        row_overrides,
+        code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+        label="Inventory import row_overrides",
+    )
+    for raw_row_number, raw_override in override_payload.items():
         try:
             row_number = int(raw_row_number)
         except Exception as exc:  # noqa: BLE001
@@ -3145,14 +3259,31 @@ def _normalize_inventory_import_overrides(
                 message=f"Inventory import override for row {row_number} must be an object",
                 status_code=422,
             )
-        if raw_override.get("item_id") in (None, ""):
-            continue
+        unexpected_fields = sorted(set(raw_override) - {"item_id"})
+        if unexpected_fields:
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=(
+                    f"Inventory import override for row {row_number} has unsupported field(s): "
+                    f"{', '.join(unexpected_fields)}"
+                ),
+                status_code=422,
+            )
+        if "item_id" not in raw_override or raw_override.get("item_id") in (None, ""):
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=f"Inventory import override for row {row_number} requires item_id",
+                status_code=422,
+            )
         try:
-            item_id = int(raw_override["item_id"])
+            item_id = require_positive_int(
+                int(raw_override["item_id"]),
+                f"item_id override (row {row_number})",
+            )
         except Exception as exc:  # noqa: BLE001
             raise AppError(
                 code="INVALID_INVENTORY_IMPORT_OVERRIDE",
-                message=f"item_id override must be an integer (row {row_number})",
+                message=f"item_id override must be an integer > 0 (row {row_number})",
                 status_code=422,
             ) from exc
         normalized[row_number] = {"item_id": item_id}
@@ -3372,6 +3503,12 @@ def import_inventory_movements_from_rows(
 ) -> dict[str, Any]:
     operations: list[dict[str, Any]] = []
     normalized_overrides = _normalize_inventory_import_overrides(row_overrides)
+    _validate_import_override_rows(
+        normalized_overrides,
+        valid_row_numbers=_valid_csv_row_numbers(rows),
+        code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+        label="Inventory import row_overrides",
+    )
     for idx, raw_row in enumerate(rows, start=2):
         row = dict(raw_row)
         override = normalized_overrides.get(idx, {})
@@ -3524,7 +3661,12 @@ def _normalize_reservations_import_overrides(
     row_overrides: dict[str | int, Any] | None,
 ) -> dict[int, dict[str, int]]:
     normalized: dict[int, dict[str, int]] = {}
-    for raw_row_number, raw_override in (row_overrides or {}).items():
+    override_payload = _require_json_object(
+        row_overrides,
+        code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+        label="Reservation import row_overrides",
+    )
+    for raw_row_number, raw_override in override_payload.items():
         try:
             row_number = int(raw_row_number)
         except Exception as exc:  # noqa: BLE001
@@ -3545,23 +3687,60 @@ def _normalize_reservations_import_overrides(
                 message=f"Reservation import override for row {row_number} must be an object",
                 status_code=422,
             )
+        unexpected_fields = sorted(set(raw_override) - {"item_id", "assembly_id"})
+        if unexpected_fields:
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=(
+                    f"Reservation import override for row {row_number} has unsupported field(s): "
+                    f"{', '.join(unexpected_fields)}"
+                ),
+                status_code=422,
+            )
+        if not raw_override:
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=(
+                    f"Reservation import override for row {row_number} must include "
+                    "item_id or assembly_id"
+                ),
+                status_code=422,
+            )
         override: dict[str, int] = {}
-        if raw_override.get("item_id") not in (None, ""):
+        if "item_id" in raw_override:
+            if raw_override.get("item_id") in (None, ""):
+                raise AppError(
+                    code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                    message=f"item_id override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                )
             try:
-                override["item_id"] = int(raw_override["item_id"])
+                override["item_id"] = require_positive_int(
+                    int(raw_override["item_id"]),
+                    f"item_id override (row {row_number})",
+                )
             except Exception as exc:  # noqa: BLE001
                 raise AppError(
                     code="INVALID_RESERVATION_IMPORT_OVERRIDE",
-                    message=f"item_id override must be an integer (row {row_number})",
+                    message=f"item_id override must be an integer > 0 (row {row_number})",
                     status_code=422,
                 ) from exc
-        if raw_override.get("assembly_id") not in (None, ""):
+        if "assembly_id" in raw_override:
+            if raw_override.get("assembly_id") in (None, ""):
+                raise AppError(
+                    code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                    message=f"assembly_id override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                )
             try:
-                override["assembly_id"] = int(raw_override["assembly_id"])
+                override["assembly_id"] = require_positive_int(
+                    int(raw_override["assembly_id"]),
+                    f"assembly_id override (row {row_number})",
+                )
             except Exception as exc:  # noqa: BLE001
                 raise AppError(
                     code="INVALID_RESERVATION_IMPORT_OVERRIDE",
-                    message=f"assembly_id override must be an integer (row {row_number})",
+                    message=f"assembly_id override must be an integer > 0 (row {row_number})",
                     status_code=422,
                 ) from exc
         if "item_id" in override and "assembly_id" in override:
@@ -3830,6 +4009,12 @@ def import_reservations_from_rows(
     created: list[dict[str, Any]] = []
     assembly_map = _assembly_lookup_map(conn)
     normalized_overrides = _normalize_reservations_import_overrides(row_overrides)
+    _validate_import_override_rows(
+        normalized_overrides,
+        valid_row_numbers=_valid_csv_row_numbers(rows),
+        code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+        label="Reservation import row_overrides",
+    )
     for idx, raw_row in enumerate(rows, start=2):
         row = dict(raw_row)
         qty_raw = row.get("quantity")
@@ -4732,7 +4917,12 @@ def _normalize_order_import_overrides(
     row_overrides: dict[str | int, Any] | None,
 ) -> dict[int, dict[str, int]]:
     normalized: dict[int, dict[str, int]] = {}
-    for raw_row_number, raw_override in (row_overrides or {}).items():
+    override_payload = _require_json_object(
+        row_overrides,
+        code="INVALID_ORDER_IMPORT_OVERRIDE",
+        label="Order import row_overrides",
+    )
+    for raw_row_number, raw_override in override_payload.items():
         try:
             row_number = int(raw_row_number)
         except Exception as exc:  # noqa: BLE001
@@ -4754,16 +4944,41 @@ def _normalize_order_import_overrides(
                 status_code=422,
             )
         override: dict[str, int] = {}
-        if raw_override.get("item_id") not in (None, ""):
+        unexpected_fields = sorted(set(raw_override) - {"item_id", "units_per_order"})
+        if unexpected_fields:
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_OVERRIDE",
+                message=(
+                    f"Order import override for row {row_number} has unsupported field(s): "
+                    f"{', '.join(unexpected_fields)}"
+                ),
+                status_code=422,
+            )
+        if "item_id" in raw_override:
+            if raw_override.get("item_id") in (None, ""):
+                raise AppError(
+                    code="INVALID_ORDER_IMPORT_OVERRIDE",
+                    message=f"item_id override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                )
             try:
-                override["item_id"] = int(raw_override["item_id"])
+                override["item_id"] = require_positive_int(
+                    int(raw_override["item_id"]),
+                    f"item_id override (row {row_number})",
+                )
             except Exception as exc:  # noqa: BLE001
                 raise AppError(
                     code="INVALID_ORDER_IMPORT_OVERRIDE",
-                    message=f"item_id override must be an integer (row {row_number})",
+                    message=f"item_id override must be an integer > 0 (row {row_number})",
                     status_code=422,
                 ) from exc
-        if raw_override.get("units_per_order") not in (None, ""):
+        if "units_per_order" in raw_override:
+            if raw_override.get("units_per_order") in (None, ""):
+                raise AppError(
+                    code="INVALID_ORDER_IMPORT_OVERRIDE",
+                    message=f"units_per_order override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                )
             try:
                 override["units_per_order"] = require_positive_int(
                     int(raw_override["units_per_order"]),
@@ -4775,8 +4990,16 @@ def _normalize_order_import_overrides(
                     message=f"units_per_order override must be an integer > 0 (row {row_number})",
                     status_code=422,
                 ) from exc
-        if override:
-            normalized[row_number] = override
+        if not override:
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_OVERRIDE",
+                message=(
+                    f"Order import override for row {row_number} must include "
+                    "item_id or units_per_order"
+                ),
+                status_code=422,
+            )
+        normalized[row_number] = override
     return normalized
 
 
@@ -4784,11 +5007,23 @@ def _normalize_order_import_alias_saves(
     alias_saves: list[dict[str, Any]] | None,
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
-    for idx, raw_alias in enumerate(alias_saves or [], start=1):
+    alias_payload = _require_json_array(
+        alias_saves,
+        code="INVALID_ORDER_IMPORT_ALIAS",
+        label="Order import alias_saves",
+    )
+    for idx, raw_alias in enumerate(alias_payload, start=1):
         if not isinstance(raw_alias, dict):
             raise AppError(
                 code="INVALID_ORDER_IMPORT_ALIAS",
                 message=f"Alias save entry #{idx} must be an object",
+                status_code=422,
+            )
+        unexpected_fields = sorted(set(raw_alias) - {"ordered_item_number", "item_id", "units_per_order"})
+        if unexpected_fields:
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_ALIAS",
+                message=f"Alias save entry #{idx} has unsupported field(s): {', '.join(unexpected_fields)}",
                 status_code=422,
             )
         ordered_item_number = require_non_empty(
@@ -4802,11 +5037,14 @@ def _normalize_order_import_alias_saves(
                 status_code=422,
             )
         try:
-            item_id = int(raw_alias["item_id"])
+            item_id = require_positive_int(
+                int(raw_alias["item_id"]),
+                f"item_id (alias save #{idx})",
+            )
         except Exception as exc:  # noqa: BLE001
             raise AppError(
                 code="INVALID_ORDER_IMPORT_ALIAS",
-                message=f"Alias save item_id must be an integer (entry #{idx})",
+                message=f"Alias save item_id must be an integer > 0 (entry #{idx})",
                 status_code=422,
             ) from exc
         units_raw = raw_alias.get("units_per_order", 1)
@@ -5491,6 +5729,12 @@ def import_orders_from_rows(
     sid = _resolve_supplier_id(conn, supplier_id, supplier_name)
     normalized_overrides = _normalize_order_import_overrides(row_overrides)
     normalized_alias_saves = _normalize_order_import_alias_saves(alias_saves)
+    _validate_import_override_rows(
+        normalized_overrides,
+        valid_row_numbers=_valid_csv_row_numbers(rows, skip_blank_rows=True),
+        code="INVALID_ORDER_IMPORT_OVERRIDE",
+        label="Order import row_overrides",
+    )
     resolved, missing = _process_order_rows_for_import(
         conn,
         supplier_id=sid,

@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import useSWR from "swr";
 import { CatalogPicker } from "../components/CatalogPicker";
 import { apiDownload, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type {
   CatalogSearchResult,
   Item,
@@ -463,12 +464,11 @@ export function OrdersPage() {
   }
 
   function selectedPreviewMatch(row: OrderImportPreviewRow): CatalogSearchResult | null {
-    const explicitSelection = previewSelections[row.row];
-    if (explicitSelection !== undefined) {
-      return explicitSelection;
-    }
-    if (!row.suggested_match) return null;
-    return previewMatchToCatalogResult(row.suggested_match);
+    return resolvePreviewSelection(
+      previewSelections,
+      row.row,
+      row.suggested_match ? previewMatchToCatalogResult(row.suggested_match) : null
+    );
   }
 
   function previewUnitsValue(row: OrderImportPreviewRow): string {
@@ -544,7 +544,7 @@ export function OrdersPage() {
           "For unregistered folder CSV files, use 'Unregistered Folder Batch'."
         );
       } else {
-        setMessage(`Preview failed: ${messageText}`);
+        setMessage(formatActionError("Preview failed", error));
       }
     } finally {
       setLoading(false);
@@ -660,7 +660,7 @@ export function OrdersPage() {
           "For unregistered folder CSV files, use 'Unregistered Folder Batch'."
         );
       } else {
-        setMessage(`Import failed: ${messageText}`);
+        setMessage(formatActionError("Import failed", error));
       }
     } finally {
       setLoading(false);

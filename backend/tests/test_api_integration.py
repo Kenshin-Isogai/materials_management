@@ -15,6 +15,15 @@ def read_csv_response(response):
     return reader.fieldnames or [], list(reader)
 
 
+def make_csv_bytes(fieldnames, rows):
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return output.getvalue().encode("utf-8")
+
+
 def test_health_endpoint(client):
     response = client.get("/api/health")
     assert response.status_code == 200
@@ -722,6 +731,92 @@ def test_orders_import_accepts_preview_overrides_and_alias_saves(client):
     assert order_amounts["Q-PREVIEW-APPLY-001"] == 6
     assert order_amounts["Q-PREVIEW-APPLY-002"] == 3
 
+
+def test_orders_import_rejects_malformed_preview_override_json(client):
+    csv_content = make_csv_bytes(
+        [
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+        [
+            {
+                "item_number": "ORDERS-MALFORMED-JSON-ITEM",
+                "quantity": "1",
+                "quotation_number": "Q-ORDERS-MALFORMED-001",
+                "issue_date": "2026-02-21",
+                "order_date": "2026-02-22",
+                "expected_arrival": "2026-03-01",
+                "pdf_link": "",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/orders/import",
+        files={"file": ("orders-malformed.json.csv", csv_content, "text/csv")},
+        data={
+            "supplier_name": "SupplierMalformedJson",
+            "row_overrides": "{",
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert error["message"] == "row_overrides must be valid JSON"
+
+
+def test_orders_import_rejects_non_array_alias_saves(client):
+    client.post("/api/manufacturers", json={"name": "ORDER-ALIAS-SHAPE-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "ORDER-ALIAS-SHAPE-ITEM",
+            "manufacturer_name": "ORDER-ALIAS-SHAPE-MFG",
+            "category": "Lens",
+        },
+    )
+    csv_content = make_csv_bytes(
+        [
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+        [
+            {
+                "item_number": "ORDER-ALIAS-SHAPE-ITEM",
+                "quantity": "1",
+                "quotation_number": "Q-ORDER-ALIAS-SHAPE-001",
+                "issue_date": "2026-02-21",
+                "order_date": "2026-02-22",
+                "expected_arrival": "2026-03-01",
+                "pdf_link": "",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/orders/import",
+        files={"file": ("orders-alias-shape.csv", csv_content, "text/csv")},
+        data={
+            "supplier_name": "SupplierAliasShape",
+            "alias_saves": json.dumps({"ordered_item_number": "ORDER-ALIAS-SHAPE-ITEM"}),
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_ORDER_IMPORT_ALIAS"
+    assert error["message"] == "Order import alias_saves must be a JSON array"
+
+
 def test_order_import_accepts_slash_date_format(client):
     client.post("/api/manufacturers", json={"name": "API-SLASH-DATE-MFG"})
     client.post(
@@ -1127,6 +1222,49 @@ def test_items_import_accepts_preview_override_for_alias_canonical_item(client):
     assert aliases[0]["ordered_item_number"] == "ITEM-PREVIEW-OVERRIDE-ALIAS"
     assert aliases[0]["canonical_item_number"] == canonical["item_number"]
     assert aliases[0]["units_per_order"] == 3
+
+
+def test_items_import_rejects_non_object_row_overrides(client):
+    csv_content = make_csv_bytes(
+        [
+            "row_type",
+            "item_number",
+            "manufacturer_name",
+            "category",
+            "url",
+            "description",
+            "supplier",
+            "canonical_item_number",
+            "units_per_order",
+        ],
+        [
+            {
+                "row_type": "item",
+                "item_number": "ITEM-OVERRIDE-SHAPE-001",
+                "manufacturer_name": "ITEM-OVERRIDE-SHAPE-MFG",
+                "category": "Lens",
+                "url": "",
+                "description": "",
+                "supplier": "",
+                "canonical_item_number": "",
+                "units_per_order": "",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/items/import",
+        files={"file": ("items-override-shape.csv", csv_content, "text/csv")},
+        data={
+            "continue_on_error": "true",
+            "row_overrides": json.dumps([{"row": 2, "canonical_item_number": "IGNORED"}]),
+        },
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_ITEM_IMPORT_OVERRIDE"
+    assert error["message"] == "Item import row_overrides must be a JSON object keyed by CSV row number"
+
 
 def test_items_import_alias_rejects_direct_item_number_collision(client):
     client.post(
@@ -2295,6 +2433,51 @@ def test_inventory_import_accepts_preview_item_override(client):
     assert quantities["STOCK"] == 3
     assert quantities["BENCH_A"] == 2
 
+
+def test_inventory_import_rejects_unknown_override_row_number(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-MOVE-ROWREF-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-MOVE-ROWREF-ITEM",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    ).json()["data"]
+    csv_content = make_csv_bytes(
+        [
+            "operation_type",
+            "item_id",
+            "quantity",
+            "from_location",
+            "to_location",
+            "location",
+            "note",
+        ],
+        [
+            {
+                "operation_type": "ARRIVAL",
+                "item_id": str(item["item_id"]),
+                "quantity": "2",
+                "from_location": "",
+                "to_location": "STOCK",
+                "location": "",
+                "note": "rowref",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/inventory/import-csv",
+        files={"file": ("movements-rowref.csv", csv_content, "text/csv")},
+        data={"row_overrides": json.dumps({"99": {"item_id": item["item_id"]}})},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_INVENTORY_IMPORT_OVERRIDE"
+    assert "99" in error["message"]
+
+
 def test_inventory_import_csv_endpoint_rejects_non_numeric_fields(client):
     csv_content = (
         "operation_type,item_id,quantity,from_location,to_location\n"
@@ -2419,6 +2602,29 @@ def test_reservations_import_accepts_preview_target_override(client):
     assert len(rows) == 1
     assert rows[0]["item_id"] == item["item_id"]
     assert rows[0]["quantity"] == 3
+
+
+def test_reservations_import_rejects_override_without_target_field(client):
+    csv_content = make_csv_bytes(
+        ["assembly", "quantity", "purpose"],
+        [
+            {
+                "assembly": "API-RES-MISSING-TARGET-ASM",
+                "quantity": "1",
+                "purpose": "missing target override",
+            }
+        ],
+    )
+
+    response = client.post(
+        "/api/reservations/import-csv",
+        files={"file": ("reservations-missing-target.csv", csv_content, "text/csv")},
+        data={"row_overrides": json.dumps({"2": {}})},
+    )
+    assert response.status_code == 422
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_RESERVATION_IMPORT_OVERRIDE"
+    assert error["message"] == "Reservation import override for row 2 must include item_id or assembly_id"
 
 
 def test_bom_analyze_endpoint_supports_target_date_projection(client):

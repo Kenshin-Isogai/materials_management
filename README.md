@@ -97,7 +97,10 @@ uv run main.py reserve --item-id 1 --quantity 2 --purpose "Experiment A"
 
 ```powershell
 cd backend
-uv run python -m pytest
+uv run python -m pytest -q
+cd ..\frontend
+npm run test
+npm run build
 ```
 
 ## Documentation
@@ -128,6 +131,7 @@ uv run python -m pytest
   - supports per-row canonical item correction plus optional supplier-alias save on final `POST /api/orders/import`
   - `POST /api/reservations/import-preview`
   - validates item/assembly targets, previews assembly expansion, and allows per-row `item_id`/`assembly_id` correction before final `POST /api/reservations/import-csv`
+  - preview-confirmation JSON fields are strict: malformed JSON, wrong top-level shapes, missing required keys, and override row numbers not present in the uploaded CSV return `422` instead of bubbling as server errors
 - Projects quick requirement parsing:
   - `POST /api/projects/requirements/preview`
   - parses `item_number,quantity` lines, classifies exact/review/unresolved matches, and lets the UI apply corrected rows into project requirements
@@ -149,3 +153,4 @@ uv run python -m pytest
 
 - Typed selector search for write flows: `GET /api/catalog/search?q=...&types=item,assembly,supplier,project`
 - `CatalogPicker` now powers Projects requirements, Assemblies components, BOM spreadsheet entry and BOM preview reconciliation, Reservations entry, and Items/Orders/Movements/Reservations import reconciliation
+- Single-select `CatalogPicker` inputs now resync their visible text when the parent selection changes while the popover is open, so preview correction rows stay aligned with the final submitted state

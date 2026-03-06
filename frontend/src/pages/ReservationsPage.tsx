@@ -2,6 +2,7 @@ import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { apiDownload, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
 import { CatalogPicker } from "../components/CatalogPicker";
+import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type { CatalogSearchResult, Item, Reservation } from "../lib/types";
 
 type ReservationRow = {
@@ -120,7 +121,11 @@ export function ReservationsPage() {
   function selectedReservationPreviewMatch(
     row: ReservationImportPreviewRow
   ): CatalogSearchResult | null {
-    return reservationPreviewSelections[row.row] ?? row.suggested_match ?? null;
+    return resolvePreviewSelection(
+      reservationPreviewSelections,
+      row.row,
+      row.suggested_match ?? null
+    );
   }
 
   function previewStatusTone(status: ReservationImportPreviewRow["status"]): string {
@@ -181,6 +186,8 @@ export function ReservationsPage() {
           ? `Preview ready: ${result.summary.total_rows} row(s) are ready to import.`
           : `Preview ready: review=${result.summary.needs_review}, unresolved=${result.summary.unresolved}.`
       );
+    } catch (error) {
+      setReservationMessage(formatActionError("Preview failed", error));
     } finally {
       setLoading(false);
     }
@@ -232,6 +239,8 @@ export function ReservationsPage() {
       setReservationCsvFile(null);
       resetReservationPreview();
       await mutate();
+    } catch (error) {
+      setReservationMessage(formatActionError("Import failed", error));
     } finally {
       setLoading(false);
     }

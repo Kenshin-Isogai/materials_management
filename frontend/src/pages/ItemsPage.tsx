@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import useSWR from "swr";
 import { CatalogPicker } from "../components/CatalogPicker";
 import { apiDownload, apiGet, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type { CatalogSearchResult, Item, MissingItemResolverRow } from "../lib/types";
 
 type ItemRowType = "item" | "alias";
@@ -590,12 +591,11 @@ export function ItemsPage() {
   function selectedCsvPreviewMatch(
     row: ItemImportPreviewRow
   ): CatalogSearchResult | null {
-    const explicitSelection = csvPreviewSelections[row.row];
-    if (explicitSelection !== undefined) {
-      return explicitSelection;
-    }
-    if (!row.suggested_match) return null;
-    return itemPreviewMatchToCatalogResult(row.suggested_match);
+    return resolvePreviewSelection(
+      csvPreviewSelections,
+      row.row,
+      row.suggested_match ? itemPreviewMatchToCatalogResult(row.suggested_match) : null
+    );
   }
 
   function previewUnitsValue(row: ItemImportPreviewRow): string {
@@ -636,7 +636,7 @@ export function ItemsPage() {
           : `Preview ready: review=${result.summary.needs_review}, unresolved=${result.summary.unresolved}.`
       );
     } catch (error) {
-      setCsvMessage(String(error instanceof Error ? error.message : error));
+      setCsvMessage(formatActionError("Preview failed", error));
     } finally {
       setSubmitting(false);
     }
@@ -713,7 +713,7 @@ export function ItemsPage() {
       await mutateImportJobs();
       await mutateSelectedImportJob();
     } catch (error) {
-      setCsvMessage(String(error instanceof Error ? error.message : error));
+      setCsvMessage(formatActionError("Import failed", error));
     } finally {
       setSubmitting(false);
     }

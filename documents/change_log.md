@@ -51,6 +51,17 @@
 
 ### Fixed
 
+- Cleaned `.gitignore` merge artifacts and duplicate local-ignore sections so the ignore rules are intentional again.
+- Hardened preview-confirmation multipart JSON validation for item, movement, order, and reservation imports.
+  - malformed JSON now returns `422 INVALID_REQUEST`
+  - wrong top-level shapes, missing required keys, unsupported fields, and CSV row references that do not exist now return deterministic flow-specific `422` errors
+  - these validation failures no longer bubble as `5xx`
+- Corrected preview reconciliation state handling in the frontend.
+  - `CatalogPicker` single-select inputs now resync visible text when parent state changes while the picker is open
+  - movement and reservation preview confirmation now preserve an explicit cleared selection instead of silently falling back to a stale suggested match
+- Expanded in-page error surfacing for preview-first workflows.
+  - movement import, reservation import, Projects quick-entry preview, BOM analyze/reserve, and item/order import preview messaging now consistently show user-visible failure text instead of relying on uncaught promise errors
+
 - Corrected planning pipeline handling for already-started committed projects.
   - `CONFIRMED` / `ACTIVE` projects are no longer dropped when their `planned_start` is earlier than today.
   - In-flight committed projects can now be analyzed through `GET /api/projects/{project_id}/planning-analysis` without a false `INVALID_TARGET_DATE`.
@@ -77,8 +88,11 @@
 ### Docs
 
 - Updated `README.md` with the new `Projects -> Planning -> RFQ -> Orders / Reservations` workflow.
+- Updated `README.md` with frontend test commands plus the stricter preview-confirmation override validation notes.
 - Updated `specification.md` with RFQ tables, project-linked order semantics, planning endpoint contracts, revised project planning behavior, and the RFQ-owned order assignment guardrails.
+- Updated `specification.md` with strict `422` contracts for preview-confirmation `row_overrides` / `alias_saves`.
 - Updated `documents/technical_documentation.md` with the sequential planning pipeline, RFQ architecture, and RFQ/order ownership invariants.
+- Updated `documents/technical_documentation.md` and `documents/source_current_state.md` with the stricter import validation rules, picker state-sync behavior, and preview error-surfacing notes.
 - Updated `documents/source_current_state.md` with the current Planning/RFQ behavior, including stale-link clearing and RFQ-owned order assignment rules.
 - Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with the CSV template/reference download endpoints and sticky-table UI behavior.
 - Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with preview-first item/movement/reservation CSV import behavior and endpoint contracts.
@@ -87,6 +101,15 @@
 - Updated `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with reservation override precedence, RFQ split-order ownership, and effective gap-analysis `target_date` behavior.
 
 ### Tests
+
+- Added backend API regression coverage for:
+  - malformed preview-confirmation JSON on order import
+  - wrong `row_overrides` / `alias_saves` top-level JSON shapes
+  - missing required reservation override keys
+  - out-of-range movement override row references
+- Added frontend Vitest coverage for:
+  - `CatalogPicker` syncing external single-select changes while open
+  - preview state helpers preserving explicit cleared selections and formatting user-visible action errors
 
 - Added backend regression coverage for:
   - started committed projects remaining in the planning pipeline
@@ -118,7 +141,8 @@
   - RFQ-owned order splits keeping dedicated `project_id` only on the original linked row
   - gap-analysis returning the effective planning `target_date` when callers omit one
 - Added backend API coverage for gap-analysis returning the effective planning `target_date`.
-- Backend suite executed: `uv run python -m pytest -q` -> `117 passed`.
+- Backend suite executed: `uv run python -m pytest -q` -> `122 passed`.
+- Frontend test suite executed: `npm run test` -> `3 passed`.
 - Frontend production build executed: `npm.cmd run build`.
 
 ## 2026-03-05

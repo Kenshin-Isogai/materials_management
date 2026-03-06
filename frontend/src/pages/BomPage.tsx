@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { CatalogPicker } from "../components/CatalogPicker";
 import { apiSend } from "../lib/api";
+import { formatActionError } from "../lib/previewState";
 import type { CatalogSearchResult } from "../lib/types";
 
 type BomRow = {
@@ -275,7 +276,7 @@ export function BomPage() {
           : `Preview ready: review=${data.summary.needs_review}, unresolved=${data.summary.unresolved}.`
       );
     } catch (error) {
-      setMessage(`Preview failed: ${String(error ?? "")}`);
+      setMessage(formatActionError("Preview failed", error));
     } finally {
       setLoading(false);
     }
@@ -296,6 +297,8 @@ export function BomPage() {
       });
       setResult(data);
       setMessage("Analysis updated from the preview selection set.");
+    } catch (error) {
+      setMessage(formatActionError("Analysis failed", error));
     } finally {
       setLoading(false);
     }
@@ -321,6 +324,8 @@ export function BomPage() {
       setResult({ rows: data.analysis, target_date: targetDate.trim() || null });
       resetPreview();
       setMessage(`Created ${data.created_reservations.length} reservation(s).`);
+    } catch (error) {
+      setMessage(formatActionError("Reserve failed", error));
     } finally {
       setLoading(false);
     }
@@ -348,7 +353,7 @@ export function BomPage() {
       resetPreview();
       setMessage(`Saved ${data.created_count} purchase candidate(s).`);
     } catch (error) {
-      setMessage(`Save failed: ${String(error ?? "")}`);
+      setMessage(formatActionError("Save failed", error));
     } finally {
       setLoading(false);
     }

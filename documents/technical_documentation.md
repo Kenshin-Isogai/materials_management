@@ -504,6 +504,7 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
   - `POST /api/orders/import` now accepts optional multipart JSON fields `row_overrides` and `alias_saves` so preview-confirmation can pin canonical items/units and persist supplier aliases after duplicate checks pass
   - `POST /api/reservations/import-preview` validates item/assembly target resolution, previews assembly expansion into generated component reservations, and flags inventory shortages before commit
   - `POST /api/reservations/import-csv` accepts optional multipart JSON `row_overrides` so preview confirmation can choose `item_id` or `assembly_id` targets explicitly; that explicit override wins over stale raw CSV target text during commit
+  - preview-confirmation JSON is strict across these flows: malformed JSON, wrong top-level shapes, missing required keys, unsupported fields, and row numbers not present in the uploaded CSV all return controlled `422` responses instead of uncaught server errors
 
 ## Catalog search / picker foundation
 
@@ -519,6 +520,7 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
   - `localStorage` recent selections
   - single-select and multi-select support
   - inline or popover result presentation
+  - single-select query text resync when the parent value changes while the picker is open, so preview correction panels stay aligned after external edits/reset
 - Current rollout:
   - Projects page requirement selector now uses `CatalogPicker` for item and assembly targets
   - Projects quick bulk-parser preview also uses `CatalogPicker` for manual item correction before rows are applied
@@ -528,3 +530,4 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
   - Reservations entry now uses `CatalogPicker` for item selection
   - Items, Orders, Movements, and Reservations import preview rows now use the same catalog-search payload for reconciliation corrections
   - Orders import supplier selection also uses the same picker/search contract
+  - preview-first flows now preserve an explicit cleared selection instead of silently falling back to a stale suggested match

@@ -122,6 +122,8 @@ export function CatalogPicker(props: CatalogPickerProps) {
     loadRecentSelections(recentKey)
   );
   const deferredQuery = useDeferredValue(query.trim());
+  const singleDisplayValue = props.mode === "multi" ? "" : props.value?.display_label ?? seedQuery ?? "";
+  const lastSyncedSingleDisplayRef = useRef(singleDisplayValue);
 
   const selectedItems = props.mode === "multi" ? props.value : props.value ? [props.value] : [];
   const selectedSingle = props.mode === "multi" ? null : props.value;
@@ -131,24 +133,28 @@ export function CatalogPicker(props: CatalogPickerProps) {
   }, [recentKey]);
 
   useEffect(() => {
-    if (props.mode !== "multi" && !isOpen) {
-      setQuery(props.value?.display_label ?? seedQuery ?? "");
+    if (props.mode !== "multi") {
+      const selectionChanged = singleDisplayValue !== lastSyncedSingleDisplayRef.current;
+      if (!isOpen || selectionChanged) {
+        setQuery(singleDisplayValue);
+      }
+      lastSyncedSingleDisplayRef.current = singleDisplayValue;
     }
-  }, [isOpen, props.mode, props.value, seedQuery]);
+  }, [isOpen, props.mode, singleDisplayValue]);
 
   useEffect(() => {
     function handlePointerDown(event: MouseEvent) {
       if (!rootRef.current?.contains(event.target as Node)) {
         setIsOpen(false);
         if (props.mode !== "multi") {
-          setQuery(props.value?.display_label ?? seedQuery ?? "");
+          setQuery(singleDisplayValue);
         }
       }
     }
     if (!isOpen) return;
     window.addEventListener("mousedown", handlePointerDown);
     return () => window.removeEventListener("mousedown", handlePointerDown);
-  }, [isOpen, props.mode, props.value, seedQuery]);
+  }, [isOpen, props.mode, singleDisplayValue]);
 
   const searchPath =
     isOpen && deferredQuery
@@ -256,7 +262,7 @@ export function CatalogPicker(props: CatalogPickerProps) {
       event.preventDefault();
       setIsOpen(false);
       if (props.mode !== "multi") {
-        setQuery(props.value?.display_label ?? seedQuery ?? "");
+        setQuery(singleDisplayValue);
       } else {
         setQuery("");
       }

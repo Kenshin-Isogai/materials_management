@@ -2,6 +2,7 @@ import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { apiGetWithPagination, apiSend } from "../lib/api";
 import { CatalogPicker } from "../components/CatalogPicker";
+import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type { CatalogSearchResult, Item } from "../lib/types";
 
 type ProjectRow = {
@@ -199,13 +200,11 @@ export function ProjectsPage() {
   function selectedEntryPreviewMatch(
     row: ProjectRequirementPreviewRow
   ): CatalogSearchResult | null {
-    const explicitSelection = entryPreviewSelections[row.row];
-    if (explicitSelection !== undefined) {
-      return explicitSelection;
-    }
-    if (!row.suggested_match) return null;
-    if (row.status === "needs_review" || row.status === "unresolved") return null;
-    return projectPreviewMatchToCatalogResult(row.suggested_match);
+    const fallbackSelection =
+      !row.suggested_match || row.status === "needs_review" || row.status === "unresolved"
+        ? null
+        : projectPreviewMatchToCatalogResult(row.suggested_match);
+    return resolvePreviewSelection(entryPreviewSelections, row.row, fallbackSelection);
   }
 
   async function createProject(event: FormEvent) {
@@ -328,6 +327,8 @@ export function ProjectsPage() {
           ? `Preview ready: ${preview.summary.total_rows} row(s) are ready to apply.`
           : `Preview ready: review=${preview.summary.needs_review}, unresolved=${preview.summary.unresolved}.`
       );
+    } catch (error) {
+      setEntryPreviewMessage(formatActionError("Preview failed", error));
     } finally {
       setLoading(false);
     }
