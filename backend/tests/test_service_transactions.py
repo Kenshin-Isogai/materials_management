@@ -2280,3 +2280,103 @@ def test_delete_item_blocked_when_referenced_by_purchase_candidate(conn):
 
     assert exc_info.value.code == "ITEM_REFERENCED"
     assert "purchase_candidates" in exc_info.value.message
+
+
+def test_partial_arrival_sibling_inherits_project_id(conn):
+    """P1: Arrival-split sibling must carry the original order's project_id so that
+    the remaining open quantity stays visible in project planning supply."""
+    item = _create_basic_item(conn, item_number="ITEM-ARRIVAL-SPLIT-PROJECT")
+    project = service.create_project(
+        conn,
+        {
+            "name": "PROJ-ARRIVAL-SPLIT-001",
+            "status": "PLANNING",
+            "planned_start": FUTURE_TARGET_DATE,
+            "requirements": [{"item_id": item["item_id"], "assembly_id": None, "quantity": 10}],
+        },
+    )
+    imported = service.import_orders_from_rows(
+        conn,
+        supplier_name="ARRIVAL-SPLIT-SUP",
+        rows=[
+            {
+                "item_number": item["item_number"],
+                "quantity": "10",
+                "quotation_number": "Q-ARRIVAL-SPLIT-001",
+                "issue_date": "2026-03-01",
+                "order_date": "2026-03-02",
+                "expected_arrival": FUTURE_TARGET_DATE,
+                "pdf_link": "",
+            }
+        ],
+        source_name="arrival_split.csv",
+    )
+    order_id = int(imported["order_ids"][0])
+    service.update_order(conn, order_id, {"project_id": project["project_id"]})
+
+    result = service.process_order_arrival(conn, order_id=order_id, quantity=4)
+    sibling_id = result["split_order_id"]
+    assert sibling_id is not None
+
+    sibling = service.get_order(conn, sibling_id)
+    assert int(sibling["project_id"]) == project["project_id"], (
+        "Arrival-split sibling must inherit project_id from the original order"
+    )
+    assert int(sibling["order_amount"]) == 6
+
+
+def test_manual_project_id_preserved_when_rfq_link_removed(conn):
+    """P2: A project_id set via PUT /orders/{id} must not be cleared by
+    _sync_order_project_assignment_from_rfq when the RFQ link is removed."""
+    item = _create_basic_item(conn, item_number="ITEM-MANUAL-PROJECT-RFQ")
+    project = service.create_project(
+        conn,
+        {
+            "name": "PROJ-MANUAL-PROJECT-RFQ-001",
+            "status": "PLANNING",
+            "planned_start": FUTURE_TARGET_DATE,
+            "requirements": [{"item_id": item["item_id"], "assembly_id": None, "quantity": 5}],
+        },
+    )
+    rfq = service.create_project_rfq_batch_from_analysis(
+        conn,
+        project["project_id"],
+        target_date=FUTURE_TARGET_DATE,
+    )
+    line_id = int(rfq["lines"][0]["line_id"])
+
+    imported = service.import_orders_from_rows(
+        conn,
+        supplier_name="MANUAL-PROJECT-RFQ-SUP",
+        rows=[
+            {
+                "item_number": item["item_number"],
+                "quantity": "5",
+                "quotation_number": "Q-MANUAL-PROJECT-RFQ-001",
+                "issue_date": "2026-03-01",
+                "order_date": "2026-03-02",
+                "expected_arrival": FUTURE_TARGET_DATE,
+                "pdf_link": "",
+            }
+        ],
+        source_name="manual_project_rfq.csv",
+    )
+    order_id = int(imported["order_ids"][0])
+
+    # Manually assign the project to the order BEFORE linking to the RFQ
+    service.update_order(conn, order_id, {"project_id": project["project_id"]})
+    assert int(service.get_order(conn, order_id)["project_id"]) == project["project_id"]
+
+    # Link the order to the RFQ (same project — allowed)
+    service.update_rfq_line(conn, line_id, {"linked_order_id": order_id, "status": "ORDERED"})
+    assert int(service.get_order(conn, order_id)["project_id"]) == project["project_id"]
+
+    # Remove the RFQ link — manual project_id must survive
+    service.update_rfq_line(
+        conn,
+        line_id,
+        {"linked_order_id": order_id, "status": "QUOTED", "expected_arrival": FUTURE_TARGET_DATE},
+    )
+    assert int(service.get_order(conn, order_id)["project_id"]) == project["project_id"], (
+        "Manually-assigned project_id must not be cleared when the RFQ link is removed"
+    )

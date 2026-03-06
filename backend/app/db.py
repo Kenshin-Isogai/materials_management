@@ -61,6 +61,7 @@ SCHEMA_STATEMENTS = [
         item_id INTEGER NOT NULL,
         quotation_id INTEGER NOT NULL,
         project_id INTEGER,
+        project_id_manual INTEGER NOT NULL DEFAULT 0,
         order_amount INTEGER NOT NULL CHECK (order_amount > 0),
         ordered_quantity INTEGER CHECK (ordered_quantity IS NULL OR ordered_quantity > 0),
         ordered_item_number TEXT,
@@ -529,6 +530,7 @@ def migrate_db(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
     for definition in (
         "project_id INTEGER REFERENCES projects (project_id)",
+        "project_id_manual INTEGER NOT NULL DEFAULT 0",
         "ordered_quantity INTEGER",
         "ordered_item_number TEXT",
         "status TEXT",

@@ -4319,6 +4319,8 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
         if "project_id" in payload:
             updates.append("project_id = ?")
             params.append(project_id)
+            updates.append("project_id_manual = ?")
+            params.append(1 if project_id is not None else 0)
         params.append(order_id)
         conn.execute(
             f"UPDATE orders SET {', '.join(updates)} WHERE order_id = ?",
@@ -4385,6 +4387,8 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
     if "project_id" in payload:
         split_updates.append("project_id = ?")
         split_params.append(project_id)
+        split_updates.append("project_id_manual = ?")
+        split_params.append(1 if project_id is not None else 0)
     split_params.append(order_id)
     conn.execute(
         f"UPDATE orders SET {', '.join(split_updates)} WHERE order_id = ?",
@@ -4397,17 +4401,26 @@ def update_order(conn: sqlite3.Connection, order_id: int, payload: dict[str, Any
         if rfq_project_id is not None
         else (project_id if "project_id" in payload else current.get("project_id"))
     )
+    is_rfq_derived = rfq_project_id is not None
+    is_manual_update = not is_rfq_derived and "project_id" in payload
+    if is_rfq_derived:
+        split_child_project_id_manual = 0
+    elif is_manual_update:
+        split_child_project_id_manual = 1 if project_id is not None else 0
+    else:
+        split_child_project_id_manual = int(current.get("project_id_manual") or 0)
     cur = conn.execute(
         """
         INSERT INTO orders (
-            item_id, quotation_id, project_id, order_amount, ordered_quantity, ordered_item_number,
-            order_date, expected_arrival, arrival_date, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'Ordered')
+            item_id, quotation_id, project_id, project_id_manual, order_amount, ordered_quantity,
+            ordered_item_number, order_date, expected_arrival, arrival_date, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'Ordered')
         """,
         (
             current["item_id"],
             current["quotation_id"],
             split_child_project_id,
+            split_child_project_id_manual,
             split_quantity,
             split_ordered,
             current["ordered_item_number"],
@@ -6659,13 +6672,15 @@ def process_order_arrival(
         cur = conn.execute(
             """
             INSERT INTO orders (
-                item_id, quotation_id, order_amount, ordered_quantity, ordered_item_number,
-                order_date, expected_arrival, arrival_date, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'Ordered')
+                item_id, quotation_id, project_id, project_id_manual, order_amount, ordered_quantity,
+                ordered_item_number, order_date, expected_arrival, arrival_date, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'Ordered')
             """,
             (
                 order["item_id"],
                 order["quotation_id"],
+                order.get("project_id"),
+                order.get("project_id_manual") or 0,
                 remaining_order_amount,
                 remaining_ordered,
                 order["ordered_item_number"],
@@ -8526,10 +8541,17 @@ def _ordered_rfq_project_for_order(conn: sqlite3.Connection, order_id: int) -> i
 
 def _sync_order_project_assignment_from_rfq(conn: sqlite3.Connection, order_id: int) -> None:
     project_id = _ordered_rfq_project_for_order(conn, order_id)
-    conn.execute(
-        "UPDATE orders SET project_id = ? WHERE order_id = ?",
-        (project_id, order_id),
-    )
+    if project_id is not None:
+        conn.execute(
+            "UPDATE orders SET project_id = ? WHERE order_id = ?",
+            (project_id, order_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE orders SET project_id = NULL"
+            " WHERE order_id = ? AND project_id_manual = 0",
+            (order_id,),
+        )
 
 
 def update_rfq_line(
