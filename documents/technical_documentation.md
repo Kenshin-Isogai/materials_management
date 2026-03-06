@@ -529,6 +529,8 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
   - Assemblies page component selector now uses `CatalogPicker` for item lookup
   - BOM spreadsheet entry now uses `CatalogPicker` in type-or-search mode for supplier and item cells
   - BOM preview reconciliation also uses `CatalogPicker` for supplier and item overrides before analyze/reserve/save
+  - Movements entry now uses `CatalogPicker` for item selection in the unified single/batch movement table
+  - Adding a new movement row inherits the latest completed `from/to` locations to speed repeated transfer entry
   - Reservations entry now uses `CatalogPicker` for item selection
   - Items, Orders, Movements, and Reservations import preview rows now use the same catalog-search payload for reconciliation corrections
   - Orders import supplier selection also uses the same picker/search contract

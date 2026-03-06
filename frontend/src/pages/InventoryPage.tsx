@@ -2,18 +2,17 @@ import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { CatalogPicker } from "../components/CatalogPicker";
 import { apiDownload, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import { getNextMovementEntryLocations } from "../lib/movementEntry";
 import { formatActionError, resolvePreviewSelection } from "../lib/previewState";
 import type { CatalogSearchResult, InventoryRow, Item } from "../lib/types";
 
-type MoveForm = {
+type MoveRow = {
   item_id: string;
   quantity: string;
   from_location: string;
   to_location: string;
   note: string;
 };
-
-type MoveRow = MoveForm;
 
 type InventoryImportPreviewRow = {
   row: number;
@@ -46,23 +45,20 @@ type InventoryImportPreview = {
   rows: InventoryImportPreviewRow[];
 };
 
-const blankMoveRow = (): MoveRow => ({
+const blankMoveRow = (
+  locations: Partial<Pick<MoveRow, "from_location" | "to_location">> = {},
+): MoveRow => ({
   item_id: "",
   quantity: "",
-  from_location: "STOCK",
-  to_location: "",
+  from_location: locations.from_location ?? "STOCK",
+  to_location: locations.to_location ?? "",
   note: ""
 });
 
+const initialMoveRows = (count = 4): MoveRow[] => Array.from({ length: count }, () => blankMoveRow());
+
 export function InventoryPage() {
-  const [form, setForm] = useState<MoveForm>({
-    item_id: "",
-    quantity: "",
-    from_location: "STOCK",
-    to_location: "",
-    note: ""
-  });
-  const [bulkRows, setBulkRows] = useState<MoveRow[]>([blankMoveRow(), blankMoveRow()]);
+  const [bulkRows, setBulkRows] = useState<MoveRow[]>(() => initialMoveRows());
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [movementCsvFile, setMovementCsvFile] = useState<File | null>(null);
   const [movementBatchId, setMovementBatchId] = useState("");
@@ -95,10 +91,6 @@ export function InventoryPage() {
       ),
     [items]
   );
-
-  function itemLabel(item: Item) {
-    return `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`;
-  }
 
   function resetMovementPreview() {
     setMovementPreview(null);
@@ -213,33 +205,16 @@ export function InventoryPage() {
     }
   }
 
-  async function submitMove(event: FormEvent) {
-    event.preventDefault();
-    setIsSubmitting(true);
-    try {
-      await apiSend("/inventory/move", {
-        method: "POST",
-        body: JSON.stringify({
-          item_id: Number(form.item_id),
-          quantity: Number(form.quantity),
-          from_location: form.from_location,
-          to_location: form.to_location,
-          note: form.note || undefined
-        })
-      });
-      setForm((prev) => ({ ...prev, quantity: "", note: "", to_location: "" }));
-      await mutate();
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
   function updateBulkRow(index: number, patch: Partial<MoveRow>) {
     setBulkRows((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
   function removeBulkRow(index: number) {
     setBulkRows((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function addBulkRow() {
+    setBulkRows((prev) => [...prev, blankMoveRow(getNextMovementEntryLocations(prev))]);
   }
 
   async function submitBulk() {
@@ -266,7 +241,7 @@ export function InventoryPage() {
         method: "POST",
         body: JSON.stringify({ operations })
       });
-      setBulkRows([blankMoveRow(), blankMoveRow()]);
+      setBulkRows(initialMoveRows());
       await mutate();
     } finally {
       setIsSubmitting(false);
@@ -443,68 +418,22 @@ export function InventoryPage() {
         )}
       </section>
 
-      <section className="grid gap-5 lg:grid-cols-2">
-        <form className="panel grid gap-3 p-4" onSubmit={submitMove}>
-          <h2 className="font-display text-lg font-semibold">Single Move</h2>
-          <select
-            className="input"
-            value={form.item_id}
-            onChange={(e) => setForm((p) => ({ ...p, item_id: e.target.value }))}
-            required
+      <section className="panel space-y-3 p-4">
+        <div className="flex items-center justify-between">
+          <h2 className="font-display text-lg font-semibold">Movement Entry</h2>
+          <button
+            className="button-subtle"
+            type="button"
+            onClick={addBulkRow}
           >
-            <option value="">Select item</option>
-            {items.map((item) => (
-              <option key={item.item_id} value={item.item_id}>
-                {itemLabel(item)}
-              </option>
-            ))}
-          </select>
-          <input
-            className="input"
-            placeholder="Quantity"
-            type="number"
-            min={1}
-            value={form.quantity}
-            onChange={(e) => setForm((p) => ({ ...p, quantity: e.target.value }))}
-            required
-          />
-          <input
-            className="input"
-            placeholder="From location"
-            value={form.from_location}
-            onChange={(e) => setForm((p) => ({ ...p, from_location: e.target.value }))}
-            required
-          />
-          <input
-            className="input"
-            placeholder="To location"
-            value={form.to_location}
-            onChange={(e) => setForm((p) => ({ ...p, to_location: e.target.value }))}
-            required
-          />
-          <input
-            className="input"
-            placeholder="Note (optional)"
-            value={form.note}
-            onChange={(e) => setForm((p) => ({ ...p, note: e.target.value }))}
-          />
-          <button className="button" disabled={isSubmitting} type="submit">
-            Move
+            Add Row
           </button>
-        </form>
-
-        <div className="panel space-y-3 p-4">
-          <div className="flex items-center justify-between">
-            <h2 className="font-display text-lg font-semibold">Bulk Move Entry</h2>
-            <button
-              className="button-subtle"
-              onClick={() => setBulkRows((prev) => [...prev, blankMoveRow()])}
-            >
-              Add Row
-            </button>
-          </div>
-          <div className="overflow-x-auto">
-            <table className="min-w-[900px] text-sm no-sticky-header">
+        </div>
+        <p className="text-xs text-slate-500">
+          Single-item and multi-item movements are both handled here.
+        </p>
+        <div className="overflow-x-auto">
+          <table className="min-w-full text-sm no-sticky-header">
               <thead>
                 <tr className="border-b border-slate-200 text-left text-slate-500">
                   <th className="px-2 py-2">Item</th>
@@ -519,18 +448,17 @@ export function InventoryPage() {
                 {bulkRows.map((row, idx) => (
                   <tr key={idx} className="border-b border-slate-100">
                     <td className="px-2 py-2">
-                      <select
-                        className="input"
-                        value={row.item_id}
-                        onChange={(e) => updateBulkRow(idx, { item_id: e.target.value })}
-                      >
-                        <option value="">Select item</option>
-                        {items.map((item) => (
-                          <option key={item.item_id} value={item.item_id}>
-                            {itemLabel(item)}
-                          </option>
-                        ))}
-                      </select>
+                      <div className="min-w-[18rem]">
+                        <CatalogPicker
+                          allowedTypes={["item"]}
+                          onChange={(value) =>
+                            updateBulkRow(idx, { item_id: value ? String(value.entity_id) : "" })
+                          }
+                          placeholder="Search items"
+                          recentKey="movements-entry-item"
+                          value={row.item_id ? itemCatalogById.get(Number(row.item_id)) ?? null : null}
+                        />
+                      </div>
                     </td>
                     <td className="px-2 py-2">
                       <input
@@ -563,19 +491,18 @@ export function InventoryPage() {
                       />
                     </td>
                     <td className="px-2 py-2">
-                      <button className="button-subtle" onClick={() => removeBulkRow(idx)}>
+                      <button className="button-subtle" type="button" onClick={() => removeBulkRow(idx)}>
                         Del
                       </button>
                     </td>
                   </tr>
                 ))}
               </tbody>
-            </table>
-          </div>
-          <button className="button" disabled={isSubmitting} onClick={submitBulk}>
-            Submit Bulk Moves
-          </button>
+          </table>
         </div>
+        <button className="button" disabled={isSubmitting} onClick={submitBulk} type="button">
+          Submit Moves
+        </button>
       </section>
 
       <section className="panel p-4">

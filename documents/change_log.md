@@ -48,6 +48,11 @@
   - BOM preview returns ranked supplier and item candidates plus projected canonical quantity, available stock, and shortage for the suggested item match.
   - BOM page is now preview-first and uses `CatalogPicker` for row-level supplier/item correction inside the preview.
   - `POST /api/bom/analyze` no longer creates missing suppliers as a side effect when a row resolves by direct canonical item number.
+- Simplified the Movements page entry workflow.
+  - Removed the separate `Single Move` form.
+  - Expanded the table-based `Movement Entry` section to cover both one-off and multi-row moves.
+  - Switched movement rows to `CatalogPicker` item selection and widened the editable grid to use the full panel width.
+  - `Add Row` now inherits the latest completed `from/to` locations so repeated transfers keep the same source/destination pair by default.
 
 ### Fixed
 
@@ -108,6 +113,7 @@
 - Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with the new Projects quick-parser preview endpoint and workflow.
 - Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with the new BOM preview endpoint and preview-first reconciliation workflow.
 - Updated `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with reservation override precedence, RFQ split-order ownership, and effective gap-analysis `target_date` behavior.
+- Updated `documents/technical_documentation.md` and `documents/source_current_state.md` with the unified Movements entry workflow, `CatalogPicker` rollout, and movement-row location inheritance behavior.
 
 ### Tests
 
@@ -118,6 +124,7 @@
   - out-of-range movement override row references
 - Added frontend Vitest coverage for:
   - `CatalogPicker` syncing external single-select changes while open
+  - movement-entry location inheritance when adding new rows
   - preview state helpers preserving explicit cleared selections and formatting user-visible action errors
 
 - Added backend regression coverage for:
