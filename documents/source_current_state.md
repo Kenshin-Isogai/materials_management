@@ -16,7 +16,7 @@ Last updated: 2026-03-06 (JST)
 
 - `backend/`
   - `main.py`: CLI entrypoint and command routing
-  - `app/api.py`: HTTP API routes (85 endpoints)
+  - `app/api.py`: HTTP API routes (106 endpoints)
   - `app/service.py`: domain logic (single business logic layer)
   - `app/db.py`: schema + indexes + migration logic (18 tables)
   - `tests/`: integration/service/path tests
@@ -79,9 +79,21 @@ Last updated: 2026-03-06 (JST)
 - Reservations page supports partial release/consume via quantity prompt.
 - Reservations page now uses a single expanded `Reservation Entry` table for both one-off and multi-row reservation creation (the separate `Single Reservation` form was removed).
 - Reservations and Projects page headers now include guidance clarifying scope: Reservations is execution-time allocation, Projects is future-demand planning.
-- Projects page requirement entry now supports item search suggestions (`item_number #id`) to reduce lookup time in large item catalogs.
-- Projects page requirement entry now supports bulk text parsing (`item_number,quantity` per line) with immediate warnings for unregistered item numbers and ambiguous duplicate item numbers across manufacturers.
-- Projects page `#id` free-text matching now validates the parsed id against loaded item/assembly options before marking a requirement row as matched.
+- Added typed catalog search endpoint `/api/catalog/search` for write-flow selectors (`item`, `assembly`, `supplier`, `project`).
+- Projects page requirement entry now uses `CatalogPicker` for item and assembly targets instead of ad hoc `#id` text matching/datalist suggestions.
+- Projects page requirement entry now supports preview-first bulk text parsing (`item_number,quantity` per line).
+  - `POST /api/projects/requirements/preview` classifies each line as `exact`, `high_confidence`, `needs_review`, or `unresolved`
+  - preview rows return ranked item candidates, support `CatalogPicker` correction, and can be applied back into the editable requirement grid
+- Projects page bulk-parser unresolved rows keep their raw typed query visible until the user remaps them through the picker.
+- Assemblies page component rows now use the same `CatalogPicker` item selector, with keyboard search and recent selections stored in `localStorage`.
+- BOM spreadsheet entry now uses `CatalogPicker` in type-or-search mode for supplier and item columns while still allowing raw text entry.
+- Reservations `Reservation Entry` rows now use `CatalogPicker` for item selection instead of a long static `<select>`.
+- Items manual CSV import is now preview-first:
+  - `POST /api/items/import-preview` classifies duplicate item rows, alias create/update rows, and unresolved canonical alias rows before commit
+  - preview confirmation can send per-row `canonical_item_number` / `units_per_order` overrides back through `POST /api/items/import`
+- Movements CSV import is now preview-first:
+  - `POST /api/inventory/import-preview` validates operation/location rules, simulates inventory effects row-by-row, and flags unresolved item ids or stock shortages before commit
+  - preview confirmation can send per-row `item_id` overrides back through `POST /api/inventory/import-csv`
 - Projects page now supports editing an existing project (load details into form, then save via project update API) including requirement composition/quantities.
 - Planning page is now the primary future-demand workflow surface.
   - Select a project and analyze it at its planned start (or an override date).
@@ -99,6 +111,14 @@ Last updated: 2026-03-06 (JST)
 - Orders page `Order List` now supports inline editing of `expected_arrival` (ETA) for open orders, backed by `PUT /api/orders/{order_id}`.
 - ETA edit flow supports partial postponement using split quantity (e.g., postpone 30 of 50), which creates a second open-order row with the new ETA while preserving traceability-safe quantities.
 - Backend now persists split/merge/partial-arrival order lineage in `order_lineage_events`; API exposes `POST /api/orders/merge` and `GET /api/orders/{order_id}/lineage` for durable traceability and future scale-out reporting.
+- Orders manual CSV import is now preview-first:
+  - `POST /api/orders/import-preview` classifies each row as `exact`, `high_confidence`, `needs_review`, or `unresolved`
+  - preview surfaces duplicate quotation conflicts before commit and returns ranked candidate matches
+  - preview confirmation can send per-row canonical overrides plus optional supplier-alias saves back through `POST /api/orders/import`
+- Reservations CSV import is now preview-first:
+  - `POST /api/reservations/import-preview` validates item/assembly targets, previews assembly expansion, and flags inventory shortages before commit
+  - preview confirmation can send per-row `item_id` / `assembly_id` overrides back through `POST /api/reservations/import-csv`
+- Orders import supplier input now uses `CatalogPicker`, and Items/Orders/Movements/Reservations preview reconciliation rows use the same picker for manual item/assembly correction.
 - Snapshot page supports client-side quick search, location/category filtering, low-stock/shortage-only threshold filtering, description-substring filtering, and table-column sorting (item, location, quantity, category) to accelerate planning and purchase checks from projected inventory states.
 - BOM analysis endpoint now supports optional `target_date` projection (`current net available + open orders arriving by date`) while BOM reserve remains current-availability execution behavior.
 - Project planning now has two layers:
@@ -122,6 +142,11 @@ Last updated: 2026-03-06 (JST)
 - Items page `Item List` now supports expand/collapse and auto-collapses when `Flow` is opened, reducing scroll overhead to reach the timeline panel.
 - Items page `Item List` supports client-side sorting by ID, item number, manufacturer, category, and URL.
 - Item List URL values render as clickable external links (`target=_blank`, `rel=noopener noreferrer`).
+- Import-capable pages now use backend-driven CSV downloads instead of frontend-generated examples:
+  - `Items`, `Orders`, `Movements`, and `Reservations` each expose `Download Template CSV` and `Download Reference CSV`
+  - template CSVs are header-only and encoded as UTF-8 with BOM
+  - reference CSVs are generated from live DB state at request time
+- Table headers now stay sticky across the existing horizontally scrollable table wrappers, improving scanability on table-heavy browse pages without changing the default unscoped browse behavior.
 - Dashboard overdue section supports keyword filtering and shows a full-table view when more than eight overdue rows match the filter.
 - Build system: `npm run build` (Vite production build + TypeScript build).
 
@@ -153,7 +178,7 @@ Last updated: 2026-03-06 (JST)
 
 ## 6. Quality State
 
-- Backend tests: `95 passed` (latest run on 2026-03-06).
+- Backend tests: `112 passed` (latest run on 2026-03-06).
 - Frontend production build: success (latest run on 2026-03-06).
 
 ## 7. Known Directional Gaps (intentional for current phase)
@@ -174,4 +199,19 @@ Last updated: 2026-03-06 (JST)
 
 - Added movement CSV import endpoint and service mapping to batch operations (`/api/inventory/import-csv`).
 - Added reservation CSV import endpoint with assembly-aware expansion (`/api/reservations/import-csv`), allowing one row to reserve all assembly components.
+- Added CSV template/reference download endpoints for current import-capable flows:
+  - `/api/items/import-template`, `/api/items/import-reference`
+  - `/api/inventory/import-template`, `/api/inventory/import-reference`
+  - `/api/orders/import-template`, `/api/orders/import-reference`
+  - `/api/reservations/import-template`, `/api/reservations/import-reference`
+- Added Orders manual import preview endpoint `/api/orders/import-preview` and confirmation-side `row_overrides` / `alias_saves` support on `/api/orders/import`.
+- Added preview endpoints for the remaining manual CSV flows:
+  - `/api/items/import-preview`
+  - `/api/inventory/import-preview`
+  - `/api/reservations/import-preview`
+- Added preview-confirmation `row_overrides` support on:
+  - `/api/items/import`
+  - `/api/inventory/import-csv`
+  - `/api/reservations/import-csv`
+- Added project bulk-parser preview endpoint `/api/projects/requirements/preview` for `item_number,quantity` quick-entry reconciliation before rows are applied to project requirements.
 - Movement/reservation CSV import numeric parse failures now return API validation errors (`422`) instead of internal errors for malformed rows.

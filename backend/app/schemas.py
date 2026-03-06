@@ -239,6 +239,10 @@ class ProjectUpdate(BaseModel):
     requirements: list[ProjectRequirementInput] | None = None
 
 
+class ProjectRequirementPreviewRequest(BaseModel):
+    text: str = ""
+
+
 class BomLineInput(BaseModel):
     supplier: str
     item_number: str

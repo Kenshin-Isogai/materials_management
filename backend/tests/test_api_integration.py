@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 import csv
+import json
 from io import StringIO
 from pathlib import Path
 
 FUTURE_TARGET_DATE = "2999-12-31"
+
+
+def read_csv_response(response):
+    reader = csv.DictReader(StringIO(response.content.decode("utf-8-sig")))
+    return reader.fieldnames or [], list(reader)
+
 
 def test_health_endpoint(client):
     response = client.get("/api/health")
@@ -465,6 +472,254 @@ def test_order_import_rejects_duplicate_quotation_for_same_supplier(client):
     assert payload["error"]["code"] == "DUPLICATE_QUOTATION_IMPORT"
     assert payload["error"]["details"]["quotation_numbers"] == ["Q-DUP-001"]
 
+
+def test_orders_import_preview_endpoint_classifies_matches_and_duplicate_quotations(client):
+    client.post("/api/manufacturers", json={"name": "API-PREVIEW-MFG"})
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "KM100",
+            "manufacturer_name": "API-PREVIEW-MFG",
+            "category": "Mirror Mount",
+        },
+    ).json()["data"]
+    supplier = client.post("/api/suppliers", json={"name": "SupplierPreview"}).json()["data"]
+    alias = client.post(
+        f"/api/suppliers/{supplier['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "ThorLabs KM100",
+            "canonical_item_id": item["item_id"],
+            "units_per_order": 2,
+        },
+    )
+    assert alias.status_code == 200
+
+    existing_csv = StringIO()
+    existing_writer = csv.DictWriter(
+        existing_csv,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    existing_writer.writeheader()
+    existing_writer.writerow(
+        {
+            "item_number": "KM100",
+            "quantity": "1",
+            "quotation_number": "Q-DUP-PREVIEW",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "",
+        }
+    )
+    imported = client.post(
+        "/api/orders/import",
+        files={"file": ("existing.csv", existing_csv.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierPreview"},
+    )
+    assert imported.status_code == 200
+
+    preview_csv = StringIO()
+    preview_writer = csv.DictWriter(
+        preview_csv,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    preview_writer.writeheader()
+    preview_writer.writerow(
+        {
+            "item_number": "ThorLabs KM100",
+            "quantity": "2",
+            "quotation_number": "Q-DUP-PREVIEW",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "Q-DUP-PREVIEW.pdf",
+        }
+    )
+    preview_writer.writerow(
+        {
+            "item_number": "KM100 mount",
+            "quantity": "1",
+            "quotation_number": "Q-REVIEW-PREVIEW",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "",
+        }
+    )
+    preview_writer.writerow(
+        {
+            "item_number": "NO-MATCH-XYZ",
+            "quantity": "1",
+            "quotation_number": "Q-UNRESOLVED-PREVIEW",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "",
+        }
+    )
+
+    response = client.post(
+        "/api/orders/import-preview",
+        files={"file": ("preview.csv", preview_csv.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierPreview"},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+
+    assert payload["supplier"]["supplier_id"] == supplier["supplier_id"]
+    assert payload["supplier"]["exists"] is True
+    assert payload["summary"]["exact"] == 1
+    assert payload["summary"]["needs_review"] == 1
+    assert payload["summary"]["unresolved"] == 1
+    assert payload["can_auto_accept"] is False
+    assert payload["duplicate_quotation_numbers"] == ["Q-DUP-PREVIEW"]
+    assert payload["blocking_errors"]
+
+    rows = payload["rows"]
+    assert rows[0]["status"] == "exact"
+    assert rows[0]["suggested_match"]["canonical_item_number"] == "KM100"
+    assert rows[0]["suggested_match"]["units_per_order"] == 2
+    assert "Quotation already imported for this supplier." in rows[0]["warnings"]
+
+    assert rows[1]["status"] == "needs_review"
+    assert rows[1]["suggested_match"]["canonical_item_number"] == "KM100"
+    assert rows[1]["confidence_score"] >= 70
+
+    assert rows[2]["status"] == "unresolved"
+    assert rows[2]["suggested_match"] is None
+
+
+def test_orders_import_accepts_preview_overrides_and_alias_saves(client):
+    client.post("/api/manufacturers", json={"name": "API-PREVIEW-APPLY-MFG"})
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "KM100",
+            "manufacturer_name": "API-PREVIEW-APPLY-MFG",
+            "category": "Mirror Mount",
+        },
+    ).json()["data"]
+
+    upload = StringIO()
+    writer = csv.DictWriter(
+        upload,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "item_number": "ThorLabs KM100",
+            "quantity": "2",
+            "quotation_number": "Q-PREVIEW-APPLY-001",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "",
+        }
+    )
+
+    response = client.post(
+        "/api/orders/import",
+        files={"file": ("apply.csv", upload.getvalue().encode("utf-8"), "text/csv")},
+        data={
+            "supplier_name": "SupplierPreviewApply",
+            "row_overrides": json.dumps(
+                {
+                    "2": {
+                        "item_id": item["item_id"],
+                        "units_per_order": 3,
+                    }
+                }
+            ),
+            "alias_saves": json.dumps(
+                [
+                    {
+                        "ordered_item_number": "ThorLabs KM100",
+                        "item_id": item["item_id"],
+                        "units_per_order": 3,
+                    }
+                ]
+            ),
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["status"] == "ok"
+    assert payload["imported_count"] == 1
+    assert payload["saved_alias_count"] == 1
+
+    orders = client.get("/api/orders?supplier=SupplierPreviewApply&per_page=50")
+    assert orders.status_code == 200
+    assert orders.json()["data"][0]["canonical_item_number"] == "KM100"
+    assert orders.json()["data"][0]["ordered_item_number"] == "ThorLabs KM100"
+    assert orders.json()["data"][0]["order_amount"] == 6
+
+    second_upload = StringIO()
+    second_writer = csv.DictWriter(
+        second_upload,
+        fieldnames=[
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    )
+    second_writer.writeheader()
+    second_writer.writerow(
+        {
+            "item_number": "ThorLabs KM100",
+            "quantity": "1",
+            "quotation_number": "Q-PREVIEW-APPLY-002",
+            "issue_date": "2026-02-21",
+            "order_date": "2026-02-22",
+            "expected_arrival": "2026-03-01",
+            "pdf_link": "",
+        }
+    )
+    second_response = client.post(
+        "/api/orders/import",
+        files={"file": ("apply-second.csv", second_upload.getvalue().encode("utf-8"), "text/csv")},
+        data={"supplier_name": "SupplierPreviewApply"},
+    )
+    assert second_response.status_code == 200
+    assert second_response.json()["data"]["status"] == "ok"
+
+    refreshed_orders = client.get("/api/orders?supplier=SupplierPreviewApply&per_page=50")
+    assert refreshed_orders.status_code == 200
+    order_amounts = {
+        row["quotation_number"]: row["order_amount"]
+        for row in refreshed_orders.json()["data"]
+    }
+    assert order_amounts["Q-PREVIEW-APPLY-001"] == 6
+    assert order_amounts["Q-PREVIEW-APPLY-002"] == 3
+
 def test_order_import_accepts_slash_date_format(client):
     client.post("/api/manufacturers", json={"name": "API-SLASH-DATE-MFG"})
     client.post(
@@ -716,6 +971,160 @@ def test_items_import_endpoint_supports_alias_rows_before_canonical_row(client):
     assert aliases[0]["ordered_item_number"] == "CSV-ALIAS-FIRST-P5"
     assert aliases[0]["canonical_item_number"] == "CSV-ALIAS-FIRST-CANONICAL"
     assert aliases[0]["units_per_order"] == 5
+
+
+def test_items_import_preview_endpoint_classifies_duplicate_and_alias_resolution(client):
+    client.post("/api/manufacturers", json={"name": "ITEM-PREVIEW-MFG"})
+    client.post(
+        "/api/items",
+        json={
+            "item_number": "ITEM-PREVIEW-DUP",
+            "manufacturer_name": "ITEM-PREVIEW-MFG",
+            "category": "Lens",
+        },
+    )
+    canonical = client.post(
+        "/api/items",
+        json={
+            "item_number": "ITEM-PREVIEW-CANONICAL",
+            "manufacturer_name": "ITEM-PREVIEW-MFG",
+            "category": "Lens",
+        },
+    ).json()["data"]
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "row_type",
+            "item_number",
+            "manufacturer_name",
+            "category",
+            "url",
+            "description",
+            "supplier",
+            "canonical_item_number",
+            "units_per_order",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "row_type": "item",
+            "item_number": "ITEM-PREVIEW-DUP",
+            "manufacturer_name": "ITEM-PREVIEW-MFG",
+            "category": "Lens",
+            "url": "",
+            "description": "",
+            "supplier": "",
+            "canonical_item_number": "",
+            "units_per_order": "",
+        }
+    )
+    writer.writerow(
+        {
+            "row_type": "alias",
+            "item_number": "ITEM-PREVIEW-ALIAS",
+            "manufacturer_name": "",
+            "category": "",
+            "url": "",
+            "description": "",
+            "supplier": "ITEM-PREVIEW-SUPPLIER",
+            "canonical_item_number": "ITEM-PREVIEW-CANONCAL",
+            "units_per_order": "2",
+        }
+    )
+
+    response = client.post(
+        "/api/items/import-preview",
+        files={"file": ("items-preview.csv", output.getvalue().encode("utf-8"), "text/csv")},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["summary"]["needs_review"] >= 1
+    assert payload["summary"]["total_rows"] == 2
+
+    rows = payload["rows"]
+    assert rows[0]["status"] == "needs_review"
+    assert rows[0]["action"] == "duplicate_item"
+    assert rows[1]["status"] in {"high_confidence", "needs_review"}
+    assert rows[1]["requires_user_selection"] is True
+    assert rows[1]["allowed_entity_types"] == ["item"]
+    assert rows[1]["suggested_match"]["entity_id"] == canonical["item_id"]
+    assert rows[1]["suggested_match"]["value_text"] == "ITEM-PREVIEW-CANONICAL"
+
+
+def test_items_import_accepts_preview_override_for_alias_canonical_item(client):
+    client.post("/api/manufacturers", json={"name": "ITEM-PREVIEW-OVERRIDE-MFG"})
+    canonical = client.post(
+        "/api/items",
+        json={
+            "item_number": "ITEM-PREVIEW-OVERRIDE-CANONICAL",
+            "manufacturer_name": "ITEM-PREVIEW-OVERRIDE-MFG",
+            "category": "Lens",
+        },
+    ).json()["data"]
+
+    output = StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "row_type",
+            "item_number",
+            "manufacturer_name",
+            "category",
+            "url",
+            "description",
+            "supplier",
+            "canonical_item_number",
+            "units_per_order",
+        ],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "row_type": "alias",
+            "item_number": "ITEM-PREVIEW-OVERRIDE-ALIAS",
+            "manufacturer_name": "",
+            "category": "",
+            "url": "",
+            "description": "",
+            "supplier": "ITEM-PREVIEW-OVERRIDE-SUPPLIER",
+            "canonical_item_number": "ITEM-PREVIEW-OVERRIDE-CANONCAL",
+            "units_per_order": "1",
+        }
+    )
+
+    response = client.post(
+        "/api/items/import",
+        files={"file": ("items-override.csv", output.getvalue().encode("utf-8"), "text/csv")},
+        data={
+            "continue_on_error": "true",
+            "row_overrides": json.dumps(
+                {
+                    "2": {
+                        "canonical_item_number": canonical["item_number"],
+                        "units_per_order": 3,
+                    }
+                }
+            ),
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["status"] == "ok"
+    assert payload["created_count"] == 1
+
+    suppliers = client.get("/api/suppliers")
+    supplier = next(
+        row
+        for row in suppliers.json()["data"]
+        if row["name"] == "ITEM-PREVIEW-OVERRIDE-SUPPLIER"
+    )
+    aliases = client.get(f"/api/suppliers/{supplier['supplier_id']}/aliases").json()["data"]
+    assert aliases[0]["ordered_item_number"] == "ITEM-PREVIEW-OVERRIDE-ALIAS"
+    assert aliases[0]["canonical_item_number"] == canonical["item_number"]
+    assert aliases[0]["units_per_order"] == 3
 
 def test_items_import_alias_rejects_direct_item_number_collision(client):
     client.post(
@@ -1488,6 +1897,302 @@ def test_delete_quotation_endpoint_removes_related_orders(client):
     assert remaining_orders.status_code == 200
     assert remaining_orders.json()["data"] == []
 
+
+def test_import_template_endpoints_return_header_only_bom_csv(client):
+    expected_headers = {
+        "/api/items/import-template": [
+            "row_type",
+            "item_number",
+            "manufacturer_name",
+            "category",
+            "url",
+            "description",
+            "supplier",
+            "canonical_item_number",
+            "units_per_order",
+        ],
+        "/api/inventory/import-template": [
+            "operation_type",
+            "item_id",
+            "quantity",
+            "from_location",
+            "to_location",
+            "location",
+            "note",
+        ],
+        "/api/orders/import-template": [
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+        "/api/reservations/import-template": [
+            "item_id",
+            "assembly",
+            "assembly_quantity",
+            "quantity",
+            "purpose",
+            "deadline",
+            "note",
+            "project_id",
+        ],
+    }
+
+    for path, headers in expected_headers.items():
+        response = client.get(path)
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/csv")
+        assert response.content[:3] == b"\xef\xbb\xbf"
+        fieldnames, rows = read_csv_response(response)
+        assert fieldnames == headers
+        assert rows == []
+
+
+def test_items_import_reference_endpoint_includes_canonical_items_and_aliases(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-ITEM-REF-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-ITEM-REF-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror",
+        },
+    ).json()["data"]
+    supplier = client.post("/api/suppliers", json={"name": "SupplierItemReference"}).json()["data"]
+    alias = client.post(
+        f"/api/suppliers/{supplier['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "SUP-ITEM-REF-001",
+            "canonical_item_id": item["item_id"],
+            "units_per_order": 6,
+        },
+    )
+    assert alias.status_code == 200
+
+    response = client.get("/api/items/import-reference")
+    assert response.status_code == 200
+
+    _, rows = read_csv_response(response)
+    assert any(
+        row["reference_type"] == "item"
+        and row["item_number"] == "API-ITEM-REF-001"
+        and row["manufacturer_name"] == "API-ITEM-REF-MFG"
+        for row in rows
+    )
+    assert any(
+        row["reference_type"] == "supplier_item_alias"
+        and row["supplier"] == "SupplierItemReference"
+        and row["ordered_item_number"] == "SUP-ITEM-REF-001"
+        and row["units_per_order"] == "6"
+        for row in rows
+    )
+
+
+def test_inventory_import_reference_endpoint_includes_live_item_ids_and_quantities(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-INV-REF-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-INV-REF-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    ).json()["data"]
+    seeded = client.post(
+        "/api/inventory/adjust",
+        json={
+            "item_id": item["item_id"],
+            "quantity_delta": 9,
+            "location": "STOCK",
+        },
+    )
+    assert seeded.status_code == 200
+
+    response = client.get("/api/inventory/import-reference")
+    assert response.status_code == 200
+
+    _, rows = read_csv_response(response)
+    assert any(
+        row["item_id"] == str(item["item_id"])
+        and row["item_number"] == "API-INV-REF-001"
+        and row["location"] == "STOCK"
+        and row["current_quantity"] == "9"
+        for row in rows
+    )
+
+
+def test_orders_import_reference_endpoint_filters_aliases_by_supplier(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-ORD-REF-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-ORD-REF-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    ).json()["data"]
+    supplier_a = client.post("/api/suppliers", json={"name": "SupplierOrdersReferenceA"}).json()["data"]
+    supplier_b = client.post("/api/suppliers", json={"name": "SupplierOrdersReferenceB"}).json()["data"]
+    alias_a = client.post(
+        f"/api/suppliers/{supplier_a['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "SUP-A-ORD-REF",
+            "canonical_item_id": item["item_id"],
+            "units_per_order": 4,
+        },
+    )
+    alias_b = client.post(
+        f"/api/suppliers/{supplier_b['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "SUP-B-ORD-REF",
+            "canonical_item_id": item["item_id"],
+            "units_per_order": 2,
+        },
+    )
+    assert alias_a.status_code == 200
+    assert alias_b.status_code == 200
+
+    response = client.get("/api/orders/import-reference?supplier_name=SupplierOrdersReferenceA")
+    assert response.status_code == 200
+
+    _, rows = read_csv_response(response)
+    assert any(
+        row["reference_type"] == "canonical_item"
+        and row["supplier_name"] == "SupplierOrdersReferenceA"
+        and row["canonical_item_number"] == "API-ORD-REF-001"
+        for row in rows
+    )
+    assert any(
+        row["reference_type"] == "supplier_item_alias"
+        and row["supplier_name"] == "SupplierOrdersReferenceA"
+        and row["ordered_item_number"] == "SUP-A-ORD-REF"
+        for row in rows
+    )
+    assert not any(row["supplier_name"] == "SupplierOrdersReferenceB" for row in rows)
+
+
+def test_reservations_import_reference_endpoint_includes_items_assemblies_and_projects(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-RES-REF-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-RES-REF-001",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror",
+        },
+    ).json()["data"]
+    assembly = client.post(
+        "/api/assemblies",
+        json={"name": "AssemblyReservationsReference", "components": [{"item_id": item["item_id"], "quantity": 2}]},
+    ).json()["data"]
+    project = client.post(
+        "/api/projects",
+        json={"name": "ProjectReservationsReference"},
+    ).json()["data"]
+
+    response = client.get("/api/reservations/import-reference")
+    assert response.status_code == 200
+
+    _, rows = read_csv_response(response)
+    assert any(
+        row["reference_type"] == "item"
+        and row["item_id"] == str(item["item_id"])
+        and row["item_number"] == "API-RES-REF-001"
+        for row in rows
+    )
+    assert any(
+        row["reference_type"] == "assembly"
+        and row["assembly_id"] == str(assembly["assembly_id"])
+        and row["assembly_name"] == "AssemblyReservationsReference"
+        for row in rows
+    )
+    assert any(
+        row["reference_type"] == "project"
+        and row["project_id"] == str(project["project_id"])
+        and row["project_name"] == "ProjectReservationsReference"
+        for row in rows
+    )
+
+
+def test_catalog_search_endpoint_returns_typed_results_and_alias_matches(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-CATALOG-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "KM100",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror Mount",
+            "description": "Kinematic mirror mount",
+        },
+    ).json()["data"]
+    supplier = client.post("/api/suppliers", json={"name": "Thorlabs Search Supplier"}).json()["data"]
+    alias = client.post(
+        f"/api/suppliers/{supplier['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "ThorLabs KM100",
+            "canonical_item_id": item["item_id"],
+            "units_per_order": 1,
+        },
+    )
+    assert alias.status_code == 200
+    assembly = client.post(
+        "/api/assemblies",
+        json={"name": "KM100 Mount Kit", "components": [{"item_id": item["item_id"], "quantity": 2}]},
+    ).json()["data"]
+    project = client.post(
+        "/api/projects",
+        json={"name": "KM100 Upgrade Project"},
+    ).json()["data"]
+
+    response = client.get(
+        "/api/catalog/search?q=KM100&types=item,assembly,supplier,project"
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["query"] == "KM100"
+    results = payload["results"]
+
+    assert any(
+        row["entity_type"] == "item"
+        and row["entity_id"] == item["item_id"]
+        and row["value_text"] == "KM100"
+        and row["match_source"] in {"item_number", "supplier_item_alias"}
+        for row in results
+    )
+    assert any(
+        row["entity_type"] == "assembly"
+        and row["entity_id"] == assembly["assembly_id"]
+        for row in results
+    )
+    assert any(
+        row["entity_type"] == "project"
+        and row["entity_id"] == project["project_id"]
+        for row in results
+    )
+
+    alias_response = client.get("/api/catalog/search?q=ThorLabs%20KM100&types=item")
+    assert alias_response.status_code == 200
+    alias_results = alias_response.json()["data"]["results"]
+    assert any(
+        row["entity_type"] == "item"
+        and row["entity_id"] == item["item_id"]
+        and row["value_text"] == "KM100"
+        and row["match_source"] == "supplier_item_alias"
+        for row in alias_results
+    )
+
+
+def test_catalog_search_endpoint_rejects_invalid_types(client):
+    response = client.get("/api/catalog/search?q=test&types=item,unknown")
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["error"]["code"] == "INVALID_CATALOG_TYPE"
+
+
 def test_inventory_import_csv_endpoint(client):
     manufacturer = client.post("/api/manufacturers", json={"name": "API-MOVE-CSV-MFG"}).json()["data"]
     item = client.post(
@@ -1517,6 +2222,76 @@ def test_inventory_import_csv_endpoint(client):
     payload = response.json()["data"]
     assert payload["batch_id"] == "api-move-csv-batch"
     assert len(payload["operations"]) == 1
+
+
+def test_inventory_import_preview_endpoint_flags_missing_item_and_stock_shortage(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-MOVE-PREVIEW-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-MOVE-PREVIEW-ITEM",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    ).json()["data"]
+    client.post(
+        "/api/inventory/adjust",
+        json={"item_id": item["item_id"], "quantity_delta": 5, "location": "STOCK"},
+    )
+
+    csv_content = (
+        "operation_type,item_id,quantity,from_location,to_location,location,note\n"
+        "MOVE,abc,2,STOCK,BENCH_A,,manual resolve\n"
+        f"MOVE,{item['item_id']},10,STOCK,BENCH_A,,too much\n"
+    ).encode("utf-8")
+
+    response = client.post(
+        "/api/inventory/import-preview",
+        files={"file": ("movements-preview.csv", csv_content, "text/csv")},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["summary"]["unresolved"] == 1
+    assert payload["summary"]["needs_review"] == 1
+    assert payload["can_auto_accept"] is False
+    assert payload["rows"][0]["requires_user_selection"] is True
+    assert payload["rows"][0]["allowed_entity_types"] == ["item"]
+    assert payload["rows"][1]["status"] == "needs_review"
+    assert "Not enough inventory" in payload["rows"][1]["message"]
+
+
+def test_inventory_import_accepts_preview_item_override(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-MOVE-OVERRIDE-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-MOVE-OVERRIDE-ITEM",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Lens",
+        },
+    ).json()["data"]
+    client.post(
+        "/api/inventory/adjust",
+        json={"item_id": item["item_id"], "quantity_delta": 5, "location": "STOCK"},
+    )
+
+    csv_content = (
+        "operation_type,item_id,quantity,from_location,to_location,location,note\n"
+        "MOVE,abc,2,STOCK,BENCH_A,,override item\n"
+    ).encode("utf-8")
+    response = client.post(
+        "/api/inventory/import-csv",
+        files={"file": ("movements-override.csv", csv_content, "text/csv")},
+        data={"row_overrides": json.dumps({"2": {"item_id": item["item_id"]}})},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert len(payload["operations"]) == 1
+
+    inventory = client.get(f"/api/inventory?item_id={item['item_id']}&per_page=50")
+    quantities = {row["location"]: row["quantity"] for row in inventory.json()["data"]}
+    assert quantities["STOCK"] == 3
+    assert quantities["BENCH_A"] == 2
 
 def test_inventory_import_csv_endpoint_rejects_non_numeric_fields(client):
     csv_content = (
@@ -1572,6 +2347,76 @@ def test_reservations_import_csv_endpoint_with_assembly(client):
     rows = response.json()["data"]
     assert len(rows) == 1
     assert rows[0]["quantity"] == 12
+
+
+def test_reservations_import_preview_endpoint_flags_target_resolution_and_stock_shortage(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-RES-PREVIEW-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-RES-PREVIEW-ITEM",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror",
+        },
+    ).json()["data"]
+    client.post(
+        "/api/inventory/adjust",
+        json={"item_id": item["item_id"], "quantity_delta": 12, "location": "STOCK"},
+    )
+    client.post(
+        "/api/assemblies",
+        json={"name": "API-RES-PREVIEW-ASM", "components": [{"item_id": item["item_id"], "quantity": 2}]},
+    )
+
+    csv_content = (
+        "item_id,assembly,assembly_quantity,quantity,purpose\n"
+        ",API-RES-PREVIEW-AMS,1,2,assembly typo\n"
+        f"{item['item_id']},, ,50,too much\n"
+    ).encode("utf-8")
+    response = client.post(
+        "/api/reservations/import-preview",
+        files={"file": ("reservations-preview.csv", csv_content, "text/csv")},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["summary"]["needs_review"] >= 1
+    assert payload["can_auto_accept"] is False
+    assert payload["rows"][0]["requires_user_selection"] is True
+    assert payload["rows"][0]["allowed_entity_types"] == ["item", "assembly"]
+    assert payload["rows"][0]["suggested_match"]["entity_type"] == "assembly"
+    assert payload["rows"][1]["status"] == "needs_review"
+    assert "Not enough available inventory" in payload["rows"][1]["message"]
+
+
+def test_reservations_import_accepts_preview_target_override(client):
+    manufacturer = client.post("/api/manufacturers", json={"name": "API-RES-OVERRIDE-MFG"}).json()["data"]
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-RES-OVERRIDE-ITEM",
+            "manufacturer_id": manufacturer["manufacturer_id"],
+            "category": "Mirror",
+        },
+    ).json()["data"]
+    client.post(
+        "/api/inventory/adjust",
+        json={"item_id": item["item_id"], "quantity_delta": 10, "location": "STOCK"},
+    )
+
+    csv_content = (
+        "assembly,quantity,purpose\n"
+        "API-RES-OVERRIDE-ASM,3,override target\n"
+    ).encode("utf-8")
+    response = client.post(
+        "/api/reservations/import-csv",
+        files={"file": ("reservations-override.csv", csv_content, "text/csv")},
+        data={"row_overrides": json.dumps({"2": {"item_id": item["item_id"]}})},
+    )
+    assert response.status_code == 200
+    rows = response.json()["data"]
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == item["item_id"]
+    assert rows[0]["quantity"] == 3
 
 
 def test_bom_analyze_endpoint_supports_target_date_projection(client):
@@ -1684,6 +2529,148 @@ def test_bom_analyze_endpoint_rejects_past_target_date(client):
     assert payload["error"]["code"] == "INVALID_TARGET_DATE"
 
 
+def test_bom_preview_endpoint_classifies_exact_review_and_unresolved_rows(client):
+    supplier = client.post("/api/suppliers", json={"name": "API-BOM-PREVIEW-SUPPLIER"}).json()["data"]
+    client.post("/api/manufacturers", json={"name": "API-BOM-PREVIEW-MFG-A"})
+    client.post("/api/manufacturers", json={"name": "API-BOM-PREVIEW-MFG-B"})
+    exact_item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-BOM-PREVIEW-CANON",
+            "manufacturer_name": "API-BOM-PREVIEW-MFG-A",
+            "category": "Lens",
+        },
+    ).json()["data"]
+    duplicate_a = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-BOM-PREVIEW-DUP",
+            "manufacturer_name": "API-BOM-PREVIEW-MFG-A",
+            "category": "Lens",
+        },
+    ).json()["data"]
+    duplicate_b = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-BOM-PREVIEW-DUP",
+            "manufacturer_name": "API-BOM-PREVIEW-MFG-B",
+            "category": "Mirror",
+        },
+    ).json()["data"]
+    alias_response = client.post(
+        f"/api/suppliers/{supplier['supplier_id']}/aliases",
+        json={
+            "ordered_item_number": "API-BOM-PREVIEW-ALIAS",
+            "canonical_item_id": exact_item["item_id"],
+            "units_per_order": 3,
+        },
+    )
+    assert alias_response.status_code == 200
+    seed_inventory = client.post(
+        "/api/inventory/adjust",
+        json={
+            "item_id": exact_item["item_id"],
+            "quantity_delta": 4,
+            "location": "STOCK",
+            "note": "seed bom preview",
+        },
+    )
+    assert seed_inventory.status_code == 200
+
+    response = client.post(
+        "/api/bom/preview",
+        json={
+            "rows": [
+                {
+                    "supplier": "API-BOM-PREVIEW-SUPPLIER",
+                    "item_number": "API-BOM-PREVIEW-ALIAS",
+                    "required_quantity": 2,
+                },
+                {
+                    "supplier": "API-BOM-PREVIEW-SUPPLIER",
+                    "item_number": "API-BOM-PREVIEW-DUP",
+                    "required_quantity": 1,
+                },
+                {
+                    "supplier": "",
+                    "item_number": "UNREGISTERED-BOM-ROW",
+                    "required_quantity": 5,
+                },
+            ],
+            "target_date": FUTURE_TARGET_DATE,
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["summary"] == {
+        "total_rows": 3,
+        "exact": 1,
+        "high_confidence": 0,
+        "needs_review": 1,
+        "unresolved": 1,
+    }
+    assert payload["target_date"] == FUTURE_TARGET_DATE
+
+    rows = payload["rows"]
+    assert rows[0]["status"] == "exact"
+    assert rows[0]["supplier_status"] == "exact"
+    assert rows[0]["item_status"] == "exact"
+    assert rows[0]["suggested_match"]["entity_id"] == exact_item["item_id"]
+    assert rows[0]["canonical_item_number"] == "API-BOM-PREVIEW-CANON"
+    assert rows[0]["units_per_order"] == 3
+    assert rows[0]["canonical_required_quantity"] == 6
+    assert rows[0]["available_stock"] == 4
+    assert rows[0]["shortage"] == 2
+
+    assert rows[1]["status"] == "needs_review"
+    assert rows[1]["requires_item_selection"] is True
+    assert {candidate["entity_id"] for candidate in rows[1]["candidates"]} == {
+        duplicate_a["item_id"],
+        duplicate_b["item_id"],
+    }
+
+    assert rows[2]["status"] == "unresolved"
+    assert rows[2]["requires_supplier_selection"] is True
+    assert rows[2]["requires_item_selection"] is True
+
+
+def test_bom_analyze_endpoint_does_not_create_unknown_supplier_for_direct_item(client):
+    client.post("/api/manufacturers", json={"name": "API-BOM-ANALYZE-MFG"})
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-BOM-ANALYZE-DIRECT",
+            "manufacturer_name": "API-BOM-ANALYZE-MFG",
+            "category": "Lens",
+        },
+    ).json()["data"]
+    supplier_list_before = client.get("/api/suppliers")
+    assert supplier_list_before.status_code == 200
+    before_names = [row["name"] for row in supplier_list_before.json()["data"]]
+
+    response = client.post(
+        "/api/bom/analyze",
+        json={
+            "rows": [
+                {
+                    "supplier": "API-BOM-UNKNOWN-SUPPLIER",
+                    "item_number": "API-BOM-ANALYZE-DIRECT",
+                    "required_quantity": 1,
+                }
+            ]
+        },
+    )
+    assert response.status_code == 200
+    row = response.json()["data"]["rows"][0]
+    assert row["status"] == "ok"
+    assert row["item_id"] == item["item_id"]
+
+    supplier_list_after = client.get("/api/suppliers")
+    assert supplier_list_after.status_code == 200
+    after_names = [row["name"] for row in supplier_list_after.json()["data"]]
+    assert after_names == before_names
+
+
 def test_project_gap_analysis_endpoint_supports_target_date(client):
     client.post("/api/manufacturers", json={"name": "API-PROJ-GAP-DATE-MFG"})
     item = client.post(
@@ -1753,6 +2740,93 @@ def test_project_gap_analysis_endpoint_supports_target_date(client):
     with_rows = with_payload["rows"]
     assert int(with_rows[0]["available_stock"]) == 7
     assert int(with_rows[0]["shortage"]) == 0
+
+
+def test_project_requirements_preview_endpoint_classifies_exact_ambiguous_and_unresolved_rows(client):
+    client.post("/api/manufacturers", json={"name": "API-PROJECT-PREVIEW-MFG-A"})
+    client.post("/api/manufacturers", json={"name": "API-PROJECT-PREVIEW-MFG-B"})
+    exact_item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-PROJECT-PREVIEW-EXACT",
+            "manufacturer_name": "API-PROJECT-PREVIEW-MFG-A",
+            "category": "Lens",
+        },
+    ).json()["data"]
+    ambiguous_a = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-PROJECT-PREVIEW-DUP",
+            "manufacturer_name": "API-PROJECT-PREVIEW-MFG-A",
+            "category": "Lens",
+        },
+    ).json()["data"]
+    ambiguous_b = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-PROJECT-PREVIEW-DUP",
+            "manufacturer_name": "API-PROJECT-PREVIEW-MFG-B",
+            "category": "Mirror",
+        },
+    ).json()["data"]
+
+    response = client.post(
+        "/api/projects/requirements/preview",
+        json={
+            "text": "\n".join(
+                    [
+                        "API-PROJECT-PREVIEW-EXACT,2",
+                        "API-PROJECT-PREVIEW-DUP,3",
+                        "ZZZ-UNREGISTERED-REQUIREMENT,4",
+                    ]
+                )
+            },
+        )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    assert payload["summary"]["total_rows"] == 3
+    assert payload["summary"]["exact"] == 1
+    assert payload["summary"]["needs_review"] == 1
+    assert payload["summary"]["unresolved"] == 1
+
+    rows = payload["rows"]
+    assert rows[0]["status"] == "exact"
+    assert rows[0]["suggested_match"]["entity_id"] == exact_item["item_id"]
+    assert rows[0]["quantity"] == "2"
+
+    assert rows[1]["status"] == "needs_review"
+    assert rows[1]["requires_user_selection"] is True
+    assert {candidate["entity_id"] for candidate in rows[1]["candidates"]} == {
+        ambiguous_a["item_id"],
+        ambiguous_b["item_id"],
+    }
+
+    assert rows[2]["status"] == "unresolved"
+    assert rows[2]["requires_user_selection"] is True
+
+
+def test_project_requirements_preview_endpoint_defaults_invalid_quantity_to_one(client):
+    client.post("/api/manufacturers", json={"name": "API-PROJECT-PREVIEW-QTY-MFG"})
+    item = client.post(
+        "/api/items",
+        json={
+            "item_number": "API-PROJECT-PREVIEW-QTY",
+            "manufacturer_name": "API-PROJECT-PREVIEW-QTY-MFG",
+            "category": "Lens",
+        },
+    ).json()["data"]
+
+    response = client.post(
+        "/api/projects/requirements/preview",
+        json={"text": "API-PROJECT-PREVIEW-QTY,abc"},
+    )
+    assert response.status_code == 200
+    payload = response.json()["data"]
+    row = payload["rows"][0]
+    assert row["status"] == "needs_review"
+    assert row["quantity"] == "1"
+    assert row["quantity_defaulted"] is True
+    assert row["suggested_match"]["entity_id"] == item["item_id"]
 
 
 def test_project_planning_analysis_endpoint_allows_started_committed_projects(client):

@@ -17,7 +17,10 @@ This document explains the implemented architecture of the Materials Management 
 ### Projects planning UX notes (frontend)
 
 - The Projects page supports requirement target lookup via searchable item input (`datalist`) so users can select from large item registries faster than scrolling long select lists.
-- Requirement entry includes a bulk text parser (`item_number,quantity` per line) that maps known item numbers to registered items, flags unmatched rows as unregistered, and explicitly treats duplicate `item_number` matches across manufacturers as ambiguous (requires manual selection).
+- Requirement entry includes a preview-first bulk text parser (`item_number,quantity` per line).
+  - `POST /api/projects/requirements/preview` classifies each line as `exact`, `high_confidence`, `needs_review`, or `unresolved`
+  - preview rows return ranked item candidates and allow manual correction through `CatalogPicker` before the frontend applies them into editable requirement rows
+  - unresolved lines can still be applied as unregistered placeholder rows so operators can finish correction in the main requirement table
 - Free-text target parsing accepts `#<id>` suffixes only when the parsed id exists in the currently loaded item/assembly options, preventing invalid IDs from being treated as matched entries.
 - Existing projects can be loaded into the same form for edit/save flows (`GET /api/projects/{id}` then `PUT /api/projects/{id}`), including requirement composition updates.
 
@@ -473,5 +476,44 @@ Note: `CATEGORY_ALIASES` is intentionally not a strict foreign-key relation to `
 - Added API endpoints:
   - `POST /api/inventory/import-csv` (multipart CSV, optional `batch_id`)
   - `POST /api/reservations/import-csv` (multipart CSV)
+  - `GET /api/items/import-template`, `GET /api/items/import-reference`
+  - `GET /api/inventory/import-template`, `GET /api/inventory/import-reference`
+  - `GET /api/orders/import-template`, `GET /api/orders/import-reference`
+  - `GET /api/reservations/import-template`, `GET /api/reservations/import-reference`
 - Movement CSV rows are normalized into existing `batch_inventory_operations`, preserving transaction log semantics and undo behavior consistency.
 - Reservation CSV supports assembly references by assembly name/id and expands to component-level reservations; this reuses assembly data efficiently for planning input while keeping assembly behavior advisory.
+- Template CSV endpoints return header-only files encoded as UTF-8 with BOM for Excel compatibility; reference endpoints render live canonical DB values on demand so the frontend does not maintain duplicated template/reference logic.
+- Orders import reference supports optional `supplier_name` scoping so alias rows match the supplier currently selected in the write flow while canonical item rows remain available for direct item-number imports.
+- Manual CSV imports now support preview-first reconciliation:
+  - `POST /api/items/import-preview` classifies item rows as new-vs-duplicate and alias rows as create/update/review/unresolved before commit
+  - `POST /api/items/import` accepts optional multipart JSON `row_overrides` so preview confirmation can pin `canonical_item_number` and `units_per_order` for alias rows
+  - `POST /api/inventory/import-preview` validates movement rows against operation/location rules, simulates stock deltas in CSV order, and flags item resolution or stock-shortage problems before commit
+  - `POST /api/inventory/import-csv` accepts optional multipart JSON `row_overrides` so preview confirmation can substitute canonical `item_id` values
+  - `POST /api/orders/import-preview` parses the upload, classifies rows (`exact`, `high_confidence`, `needs_review`, `unresolved`), ranks candidate matches, and reports duplicate quotation conflicts before commit
+  - preview uses direct canonical item numbers, supplier-scoped aliases, normalized equality, and fuzzy ranking, but does not create a missing supplier during preview
+  - `POST /api/orders/import` now accepts optional multipart JSON fields `row_overrides` and `alias_saves` so preview-confirmation can pin canonical items/units and persist supplier aliases after duplicate checks pass
+  - `POST /api/reservations/import-preview` validates item/assembly target resolution, previews assembly expansion into generated component reservations, and flags inventory shortages before commit
+  - `POST /api/reservations/import-csv` accepts optional multipart JSON `row_overrides` so preview confirmation can choose `item_id` or `assembly_id` targets explicitly
+
+## Catalog search / picker foundation
+
+- Added `GET /api/catalog/search?q=...&types=item,assembly,supplier,project&limit_per_type=8`.
+- Current search coverage:
+  - `item`: canonical item number, manufacturer, category, description, supplier alias text, and alias supplier name
+  - `assembly`: assembly name and description
+  - `supplier`: supplier name
+  - `project`: project name and description
+- Search returns typed rows with `entity_type`, `entity_id`, `value_text`, `display_label`, `summary`, and `match_source`; the frontend groups them by entity type.
+- Frontend now has a reusable `CatalogPicker` component with:
+  - keyboard navigation (`ArrowUp`, `ArrowDown`, `Enter`, `Escape`)
+  - `localStorage` recent selections
+  - single-select and multi-select support
+  - inline or popover result presentation
+- Current rollout:
+  - Projects page requirement selector now uses `CatalogPicker` for item and assembly targets
+  - Projects quick bulk-parser preview also uses `CatalogPicker` for manual item correction before rows are applied
+  - Assemblies page component selector now uses `CatalogPicker` for item lookup
+  - BOM spreadsheet entry now uses `CatalogPicker` in type-or-search mode for supplier and item cells
+  - Reservations entry now uses `CatalogPicker` for item selection
+  - Items, Orders, Movements, and Reservations import preview rows now use the same catalog-search payload for reconciliation corrections
+  - Orders import supplier selection also uses the same picker/search contract

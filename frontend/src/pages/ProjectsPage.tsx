@@ -1,7 +1,8 @@
 import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { apiGetWithPagination, apiSend } from "../lib/api";
-import type { Item } from "../lib/types";
+import { CatalogPicker } from "../components/CatalogPicker";
+import type { CatalogSearchResult, Item } from "../lib/types";
 
 type ProjectRow = {
   project_id: number;
@@ -40,6 +41,38 @@ type RequirementRow = {
   match_status?: "matched" | "unregistered";
 };
 
+type ProjectRequirementPreviewMatch = CatalogSearchResult & {
+  confidence_score?: number | null;
+  match_reason?: string | null;
+};
+
+type ProjectRequirementPreviewRow = {
+  row: number;
+  raw_line: string;
+  raw_target: string;
+  quantity: string;
+  quantity_raw: string;
+  quantity_defaulted: boolean;
+  status: "exact" | "high_confidence" | "needs_review" | "unresolved";
+  message: string;
+  requires_user_selection: boolean;
+  allowed_entity_types: Array<"item">;
+  suggested_match: ProjectRequirementPreviewMatch | null;
+  candidates: ProjectRequirementPreviewMatch[];
+};
+
+type ProjectRequirementPreview = {
+  summary: {
+    total_rows: number;
+    exact: number;
+    high_confidence: number;
+    needs_review: number;
+    unresolved: number;
+  };
+  can_auto_accept: boolean;
+  rows: ProjectRequirementPreviewRow[];
+};
+
 const blankRequirement = (): RequirementRow => ({
   target_type: "ITEM",
   target_id: "",
@@ -49,6 +82,56 @@ const blankRequirement = (): RequirementRow => ({
   target_query: "",
   match_status: undefined
 });
+
+function itemToCatalogResult(item: Item): CatalogSearchResult {
+  return {
+    entity_type: "item",
+    entity_id: item.item_id,
+    value_text: item.item_number,
+    display_label: `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`,
+    summary: [item.category, `#${item.item_id}`].filter(Boolean).join(" | "),
+    match_source: "item_number",
+  };
+}
+
+function assemblyToCatalogResult(assembly: AssemblyOption): CatalogSearchResult {
+  return {
+    entity_type: "assembly",
+    entity_id: assembly.assembly_id,
+    value_text: assembly.name,
+    display_label: `${assembly.name} #${assembly.assembly_id}`,
+    summary: `Assembly #${assembly.assembly_id}`,
+    match_source: "name",
+  };
+}
+
+function projectPreviewMatchToCatalogResult(
+  match: ProjectRequirementPreviewMatch
+): CatalogSearchResult {
+  return {
+    entity_type: "item",
+    entity_id: match.entity_id,
+    value_text: match.value_text,
+    display_label: match.display_label,
+    summary: match.summary,
+    match_source: match.match_source,
+  };
+}
+
+function previewStatusTone(status: ProjectRequirementPreviewRow["status"]): string {
+  switch (status) {
+    case "exact":
+      return "bg-emerald-50 text-emerald-700";
+    case "high_confidence":
+      return "bg-sky-50 text-sky-700";
+    case "needs_review":
+      return "bg-amber-50 text-amber-700";
+    case "unresolved":
+      return "bg-red-50 text-red-700";
+    default:
+      return "bg-slate-100 text-slate-700";
+  }
+}
 
 export function ProjectsPage() {
   const [name, setName] = useState("");
@@ -61,6 +144,11 @@ export function ProjectsPage() {
   const [loading, setLoading] = useState(false);
   const [entryListText, setEntryListText] = useState("");
   const [entryListWarnings, setEntryListWarnings] = useState<string[]>([]);
+  const [entryPreview, setEntryPreview] = useState<ProjectRequirementPreview | null>(null);
+  const [entryPreviewSelections, setEntryPreviewSelections] = useState<
+    Record<number, CatalogSearchResult | null>
+  >({});
+  const [entryPreviewMessage, setEntryPreviewMessage] = useState("");
   const [editingProject, setEditingProject] = useState<ProjectDetail | null>(null);
 
   const { data, error, isLoading, mutate } = useSWR("/projects", () =>
@@ -74,59 +162,50 @@ export function ProjectsPage() {
   );
   const items = itemsResp?.data ?? [];
   const assemblies = assembliesResp?.data ?? [];
-  const itemLookupByNumber = useMemo(() => {
-    const lookup = new Map<string, Item[]>();
-    for (const item of items) {
-      const key = item.item_number.trim().toLowerCase();
-      const current = lookup.get(key) ?? [];
-      current.push(item);
-      lookup.set(key, current);
-    }
-    return lookup;
-  }, [items]);
-  const itemIds = useMemo(() => new Set(items.map((item) => item.item_id)), [items]);
-  const assemblyIds = useMemo(() => new Set(assemblies.map((assembly) => assembly.assembly_id)), [assemblies]);
-
-  const itemSearchOptions = useMemo(
-    () =>
-      items.map((item) => ({
-        value: `${item.item_number} #${item.item_id}`,
-        item
-      })),
+  const itemCatalogById = useMemo(
+    () => new Map(items.map((item) => [item.item_id, itemToCatalogResult(item)])),
     [items]
   );
-
-  function itemLabel(item: Item) {
-    return `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`;
-  }
+  const assemblyCatalogById = useMemo(
+    () => new Map(assemblies.map((assembly) => [assembly.assembly_id, assemblyToCatalogResult(assembly)])),
+    [assemblies]
+  );
 
   function updateRequirement(index: number, patch: Partial<RequirementRow>) {
     setRequirements((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
   }
 
-  function updateRequirementTargetFromText(index: number, targetType: RequirementRow["target_type"], text: string) {
-    const parsedId = Number((text.split("#").pop() ?? "").trim());
-    const isKnownTarget =
-      targetType === "ITEM" ? itemIds.has(parsedId) : assemblyIds.has(parsedId);
-    if (!Number.isNaN(parsedId) && parsedId > 0 && isKnownTarget) {
-      updateRequirement(index, {
-        target_type: targetType,
-        target_id: String(parsedId),
-        target_query: text,
-        match_status: "matched"
-      });
-      return;
-    }
-    updateRequirement(index, {
-      target_type: targetType,
-      target_id: "",
-      target_query: text,
-      match_status: text.trim() ? "unregistered" : undefined
-    });
-  }
-
   function removeRequirement(index: number) {
     setRequirements((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function resetEntryPreview() {
+    setEntryPreview(null);
+    setEntryPreviewSelections({});
+  }
+
+  function applyEntryPreview(preview: ProjectRequirementPreview) {
+    const nextSelections: Record<number, CatalogSearchResult | null> = {};
+    for (const row of preview.rows) {
+      nextSelections[row.row] =
+        row.suggested_match && row.status !== "needs_review" && row.status !== "unresolved"
+          ? projectPreviewMatchToCatalogResult(row.suggested_match)
+          : null;
+    }
+    setEntryPreview(preview);
+    setEntryPreviewSelections(nextSelections);
+  }
+
+  function selectedEntryPreviewMatch(
+    row: ProjectRequirementPreviewRow
+  ): CatalogSearchResult | null {
+    const explicitSelection = entryPreviewSelections[row.row];
+    if (explicitSelection !== undefined) {
+      return explicitSelection;
+    }
+    if (!row.suggested_match) return null;
+    if (row.status === "needs_review" || row.status === "unresolved") return null;
+    return projectPreviewMatchToCatalogResult(row.suggested_match);
   }
 
   async function createProject(event: FormEvent) {
@@ -159,6 +238,8 @@ export function ProjectsPage() {
       setRequirements([blankRequirement(), blankRequirement()]);
       setEntryListText("");
       setEntryListWarnings([]);
+      setEntryPreviewMessage("");
+      resetEntryPreview();
       await mutate();
     } finally {
       setLoading(false);
@@ -169,10 +250,12 @@ export function ProjectsPage() {
     const resp = await apiSend<ProjectDetail>(`/projects/${projectId}`, { method: "GET" });
     setEditingProject(resp);
     setName(resp.name);
-    setStatus(resp.status);
-    setPlannedStart(resp.planned_start ?? "");
-    setRequirements(
-      resp.requirements.length
+      setStatus(resp.status);
+      setPlannedStart(resp.planned_start ?? "");
+      setEntryPreviewMessage("");
+      resetEntryPreview();
+      setRequirements(
+        resp.requirements.length
         ? resp.requirements.map((req) => ({
             target_type: req.item_id ? "ITEM" : "ASSEMBLY",
             target_id: String(req.item_id ?? req.assembly_id ?? ""),
@@ -219,57 +302,69 @@ export function ProjectsPage() {
       setStatus("PLANNING");
       setPlannedStart("");
       setRequirements([blankRequirement(), blankRequirement()]);
+      setEntryListText("");
+      setEntryListWarnings([]);
+      setEntryPreviewMessage("");
+      resetEntryPreview();
       await mutate();
     } finally {
       setLoading(false);
     }
   }
 
-  function parseEntryList() {
-    const warnings: string[] = [];
-    const parsedRows = entryListText
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const [itemNumberRaw, quantityRaw] = line.split(",").map((part) => part.trim());
-        const quantity = Number(quantityRaw || "1");
-        const matchedItems = itemLookupByNumber.get(itemNumberRaw.toLowerCase()) ?? [];
-        if (matchedItems.length === 0) {
-          warnings.push(`Unregistered item: ${itemNumberRaw}`);
-          return {
-            ...blankRequirement(),
-            target_type: "ITEM" as const,
-            target_query: itemNumberRaw,
-            quantity: String(Number.isFinite(quantity) && quantity > 0 ? quantity : 1),
-            match_status: "unregistered" as const
-          };
-        }
-        if (matchedItems.length > 1) {
-          warnings.push(`Ambiguous item number (multiple manufacturers): ${itemNumberRaw}`);
-          return {
-            ...blankRequirement(),
-            target_type: "ITEM" as const,
-            target_query: itemNumberRaw,
-            quantity: String(Number.isFinite(quantity) && quantity > 0 ? quantity : 1),
-            match_status: "unregistered" as const
-          };
-        }
-        const matchedItem = matchedItems[0];
+  async function previewEntryList() {
+    if (!entryListText.trim()) return;
+    setLoading(true);
+    setEntryPreviewMessage("");
+    resetEntryPreview();
+    try {
+      const preview = await apiSend<ProjectRequirementPreview>("/projects/requirements/preview", {
+        method: "POST",
+        body: JSON.stringify({ text: entryListText }),
+      });
+      applyEntryPreview(preview);
+      setEntryPreviewMessage(
+        preview.can_auto_accept
+          ? `Preview ready: ${preview.summary.total_rows} row(s) are ready to apply.`
+          : `Preview ready: review=${preview.summary.needs_review}, unresolved=${preview.summary.unresolved}.`
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function applyEntryPreviewToRequirements() {
+    if (!entryPreview) return;
+    const nextRequirements = entryPreview.rows.map((row) => {
+      const selection = selectedEntryPreviewMatch(row);
+      if (selection) {
         return {
           ...blankRequirement(),
           target_type: "ITEM" as const,
-          target_id: String(matchedItem.item_id),
-          target_query: `${matchedItem.item_number} #${matchedItem.item_id}`,
-          quantity: String(Number.isFinite(quantity) && quantity > 0 ? quantity : 1),
-          match_status: "matched" as const
+          target_id: String(selection.entity_id),
+          target_query: selection.display_label,
+          quantity: row.quantity,
+          match_status: "matched" as const,
         };
-      });
-
-    if (parsedRows.length > 0) {
-      setRequirements(parsedRows);
+      }
+      return {
+        ...blankRequirement(),
+        target_type: "ITEM" as const,
+        target_query: row.raw_target,
+        quantity: row.quantity,
+        match_status: "unregistered" as const,
+      };
+    });
+    if (nextRequirements.length > 0) {
+      setRequirements(nextRequirements);
     }
-    setEntryListWarnings(warnings);
+    setEntryListWarnings(
+      entryPreview.rows
+        .filter((row) => !selectedEntryPreviewMatch(row))
+        .map((row) => row.message)
+    );
+    setEntryPreviewMessage(`Applied ${entryPreview.rows.length} preview row(s) to requirements.`);
+    resetEntryPreview();
   }
 
   async function reserve(projectId: number) {
@@ -326,18 +421,145 @@ export function ProjectsPage() {
                 className="input min-h-[88px]"
                 placeholder={"LAS-001,2\nMIRROR-19,4"}
                 value={entryListText}
-                onChange={(e) => setEntryListText(e.target.value)}
+                onChange={(e) => {
+                  setEntryListText(e.target.value);
+                  setEntryPreviewMessage("");
+                  resetEntryPreview();
+                }}
               />
               <div className="mt-2 flex items-center gap-2">
-                <button className="button-subtle" type="button" onClick={parseEntryList}>
-                  Parse into rows
+                <button className="button-subtle" type="button" onClick={() => void previewEntryList()}>
+                  Preview Parse
                 </button>
                 {!!entryListWarnings.length && (
                   <span className="text-xs font-semibold text-amber-700">
-                    {entryListWarnings.length} unregistered item(s)
+                    {entryListWarnings.length} row(s) still need follow-up
                   </span>
                 )}
               </div>
+              {entryPreviewMessage && (
+                <p className="mt-2 text-xs text-slate-600">{entryPreviewMessage}</p>
+              )}
+              {entryPreview && (
+                <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="flex flex-wrap gap-2 text-xs">
+                    <span className="rounded-full bg-emerald-50 px-3 py-1 font-semibold text-emerald-700">
+                      Exact {entryPreview.summary.exact}
+                    </span>
+                    <span className="rounded-full bg-sky-50 px-3 py-1 font-semibold text-sky-700">
+                      High Confidence {entryPreview.summary.high_confidence}
+                    </span>
+                    <span className="rounded-full bg-amber-50 px-3 py-1 font-semibold text-amber-700">
+                      Review {entryPreview.summary.needs_review}
+                    </span>
+                    <span className="rounded-full bg-red-50 px-3 py-1 font-semibold text-red-700">
+                      Unresolved {entryPreview.summary.unresolved}
+                    </span>
+                  </div>
+                  <div className="mt-3 overflow-x-auto">
+                    <table className="min-w-[1100px] text-sm">
+                      <thead>
+                        <tr className="border-b border-slate-200 text-left text-slate-500">
+                          <th className="px-2 py-2">Line</th>
+                          <th className="px-2 py-2">Raw Input</th>
+                          <th className="px-2 py-2">Qty</th>
+                          <th className="px-2 py-2">Resolved Item</th>
+                          <th className="px-2 py-2">Status</th>
+                          <th className="px-2 py-2">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {entryPreview.rows.map((row) => (
+                          <tr key={row.row} className="border-b border-slate-100 align-top">
+                            <td className="px-2 py-3 font-semibold">#{row.row}</td>
+                            <td className="px-2 py-3">
+                              <div className="space-y-1">
+                                <p className="font-semibold text-slate-900">{row.raw_target || "(blank)"}</p>
+                                <p className="text-xs text-slate-500">{row.raw_line}</p>
+                                {row.quantity_defaulted && (
+                                  <p className="text-xs font-semibold text-amber-700">
+                                    Invalid quantity defaulted to 1
+                                  </p>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-2 py-3">{row.quantity}</td>
+                            <td className="px-2 py-3">
+                              {selectedEntryPreviewMatch(row) ? (
+                                <div className="space-y-1">
+                                  <p className="font-semibold text-slate-900">
+                                    {selectedEntryPreviewMatch(row)?.display_label}
+                                  </p>
+                                  {selectedEntryPreviewMatch(row)?.summary && (
+                                    <p className="text-xs text-slate-500">
+                                      {selectedEntryPreviewMatch(row)?.summary}
+                                    </p>
+                                  )}
+                                </div>
+                              ) : row.suggested_match ? (
+                                <div className="space-y-1">
+                                  <p className="font-semibold text-slate-900">
+                                    {row.suggested_match.display_label}
+                                  </p>
+                                  {row.suggested_match.summary && (
+                                    <p className="text-xs text-slate-500">{row.suggested_match.summary}</p>
+                                  )}
+                                </div>
+                              ) : (
+                                <p className="text-sm text-slate-500">No resolved item</p>
+                              )}
+                            </td>
+                            <td className="px-2 py-3">
+                              <span
+                                className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${previewStatusTone(row.status)}`}
+                              >
+                                {row.status}
+                              </span>
+                            </td>
+                            <td className="px-2 py-3">
+                              <div className="space-y-2">
+                                <p className="text-xs text-slate-600">{row.message}</p>
+                                {row.allowed_entity_types.length > 0 && (
+                                  <CatalogPicker
+                                    allowedTypes={row.allowed_entity_types}
+                                    onChange={(value) =>
+                                      setEntryPreviewSelections((prev) => ({
+                                        ...prev,
+                                        [row.row]: value,
+                                      }))
+                                    }
+                                    placeholder="Select item"
+                                    recentKey="project-requirement-preview-item"
+                                    seedQuery={row.raw_target}
+                                    value={selectedEntryPreviewMatch(row)}
+                                  />
+                                )}
+                                {row.candidates.length > 1 && (
+                                  <p className="text-xs text-slate-500">
+                                    Candidates:{" "}
+                                    {row.candidates
+                                      .slice(0, 3)
+                                      .map((candidate) => candidate.display_label)
+                                      .join(" | ")}
+                                  </p>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    <button className="button" type="button" onClick={applyEntryPreviewToRequirements}>
+                      Apply To Requirements
+                    </button>
+                    <button className="button-subtle" type="button" onClick={resetEntryPreview}>
+                      Clear Preview
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
             <div className="mb-2 flex items-center justify-between">
               <p className="text-sm font-semibold text-slate-700">Requirements</p>
@@ -371,7 +593,9 @@ export function ProjectsPage() {
                           onChange={(e) =>
                             updateRequirement(idx, {
                               target_type: e.target.value as RequirementRow["target_type"],
-                              target_id: ""
+                              target_id: "",
+                              target_query: "",
+                              match_status: undefined
                             })
                           }
                         >
@@ -381,35 +605,42 @@ export function ProjectsPage() {
                       </td>
                       <td className="px-2 py-2">
                         {row.target_type === "ITEM" ? (
-                          <>
-                            <input
-                              className="input"
-                              list="project-item-options"
-                              placeholder="Search item_number and pick suggestion"
-                              value={row.target_query}
-                              onChange={(e) => updateRequirementTargetFromText(idx, "ITEM", e.target.value)}
-                            />
-                            <datalist id="project-item-options">
-                              {itemSearchOptions.map((option) => (
-                                <option key={option.item.item_id} value={option.value}>
-                                  {itemLabel(option.item)}
-                                </option>
-                              ))}
-                            </datalist>
-                          </>
+                          <CatalogPicker
+                            allowedTypes={["item"]}
+                            onChange={(value) =>
+                              updateRequirement(idx, {
+                                target_id: value ? String(value.entity_id) : "",
+                                target_query: value?.display_label ?? "",
+                                match_status: value ? "matched" : undefined
+                              })
+                            }
+                            placeholder="Search items"
+                            recentKey="project-requirement-item"
+                            seedQuery={row.target_query}
+                            value={
+                              row.target_id
+                                ? itemCatalogById.get(Number(row.target_id)) ?? null
+                                : null
+                            }
+                          />
                         ) : (
-                          <select
-                            className="input"
-                            value={row.target_id}
-                            onChange={(e) => updateRequirement(idx, { target_id: e.target.value })}
-                          >
-                            <option value="">Select assembly</option>
-                            {assemblies.map((assembly) => (
-                              <option key={assembly.assembly_id} value={assembly.assembly_id}>
-                                {assembly.name} #{assembly.assembly_id}
-                              </option>
-                            ))}
-                          </select>
+                          <CatalogPicker
+                            allowedTypes={["assembly"]}
+                            onChange={(value) =>
+                              updateRequirement(idx, {
+                                target_id: value ? String(value.entity_id) : "",
+                                target_query: value?.display_label ?? "",
+                                match_status: value ? "matched" : undefined
+                              })
+                            }
+                            placeholder="Search assemblies"
+                            recentKey="project-requirement-assembly"
+                            value={
+                              row.target_id
+                                ? assemblyCatalogById.get(Number(row.target_id)) ?? null
+                                : null
+                            }
+                          />
                         )}
                         {row.match_status === "unregistered" && (
                           <p className="mt-1 text-xs font-semibold text-amber-700">No registered item matched.</p>
@@ -471,6 +702,10 @@ export function ProjectsPage() {
                   setName("");
                   setStatus("PLANNING");
                   setPlannedStart("");
+                  setEntryListText("");
+                  setEntryListWarnings([]);
+                  setEntryPreviewMessage("");
+                  resetEntryPreview();
                   setRequirements([blankRequirement(), blankRequirement()]);
                 }}
               >

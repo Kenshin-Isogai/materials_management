@@ -1,7 +1,8 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useMemo, useState } from "react";
 import useSWR from "swr";
 import { apiGetWithPagination, apiSend } from "../lib/api";
-import type { Item } from "../lib/types";
+import { CatalogPicker } from "../components/CatalogPicker";
+import type { CatalogSearchResult, Item } from "../lib/types";
 
 type AssemblyRow = {
   assembly_id: number;
@@ -9,6 +10,17 @@ type AssemblyRow = {
   description: string | null;
   component_count: number;
 };
+
+function itemToCatalogResult(item: Item): CatalogSearchResult {
+  return {
+    entity_type: "item",
+    entity_id: item.item_id,
+    value_text: item.item_number,
+    display_label: `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`,
+    summary: [item.category, `#${item.item_id}`].filter(Boolean).join(" | "),
+    match_source: "item_number",
+  };
+}
 
 export function AssembliesPage() {
   const [name, setName] = useState("");
@@ -25,10 +37,10 @@ export function AssembliesPage() {
     apiGetWithPagination<Item[]>("/items?per_page=1000")
   );
   const items = itemsResp?.data ?? [];
-
-  function itemLabel(item: Item) {
-    return `${item.item_number} (${item.manufacturer_name}) #${item.item_id}`;
-  }
+  const itemCatalogById = useMemo(
+    () => new Map(items.map((item) => [item.item_id, itemToCatalogResult(item)])),
+    [items]
+  );
 
   function updateComponent(index: number, patch: Partial<{ item_id: string; quantity: string }>) {
     setComponents((prev) => prev.map((row, i) => (i === index ? { ...row, ...patch } : row)));
@@ -127,18 +139,15 @@ export function AssembliesPage() {
                   {components.map((row, idx) => (
                     <tr key={idx} className="border-b border-slate-100">
                       <td className="px-2 py-2">
-                        <select
-                          className="input"
-                          value={row.item_id}
-                          onChange={(e) => updateComponent(idx, { item_id: e.target.value })}
-                        >
-                          <option value="">Select item</option>
-                          {items.map((item) => (
-                            <option key={item.item_id} value={item.item_id}>
-                              {itemLabel(item)}
-                            </option>
-                          ))}
-                        </select>
+                        <CatalogPicker
+                          allowedTypes={["item"]}
+                          onChange={(value) =>
+                            updateComponent(idx, { item_id: value ? String(value.entity_id) : "" })
+                          }
+                          placeholder="Search items"
+                          recentKey="assembly-components"
+                          value={row.item_id ? itemCatalogById.get(Number(row.item_id)) ?? null : null}
+                        />
                       </td>
                       <td className="px-2 py-2">
                         <input

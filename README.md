@@ -111,7 +111,37 @@ uv run python -m pytest
 
 ### CSV import shortcuts
 
+- Header-only template downloads (UTF-8 with BOM):
+  - `GET /api/items/import-template`
+  - `GET /api/inventory/import-template`
+  - `GET /api/orders/import-template`
+  - `GET /api/reservations/import-template`
+- Preview-first manual imports:
+  - `POST /api/items/import-preview`
+  - previews duplicate item rows, alias create/update behavior, and canonical-item reconciliation before final `POST /api/items/import`
+  - final item import accepts optional per-row `row_overrides` (`canonical_item_number`, `units_per_order`)
+  - `POST /api/inventory/import-preview`
+  - validates movement rows, simulates stock balance changes, and allows per-row `item_id` correction before final `POST /api/inventory/import-csv`
+  - `POST /api/orders/import-preview`
+  - classifies rows as `exact`, `high_confidence`, `needs_review`, or `unresolved`
+  - surfaces duplicate quotation conflicts before commit
+  - supports per-row canonical item correction plus optional supplier-alias save on final `POST /api/orders/import`
+  - `POST /api/reservations/import-preview`
+  - validates item/assembly targets, previews assembly expansion, and allows per-row `item_id`/`assembly_id` correction before final `POST /api/reservations/import-csv`
+- Projects quick requirement parsing:
+  - `POST /api/projects/requirements/preview`
+  - parses `item_number,quantity` lines, classifies exact/review/unresolved matches, and lets the UI apply corrected rows into project requirements
+- Live reference CSV downloads:
+  - `GET /api/items/import-reference`
+  - `GET /api/inventory/import-reference`
+  - `GET /api/orders/import-reference` (optional `?supplier_name=...`)
+  - `GET /api/reservations/import-reference`
 - Movements CSV upload: `POST /api/inventory/import-csv`
   - columns: `operation_type,item_id,quantity,from_location,to_location,location,note`
 - Reservations CSV upload: `POST /api/reservations/import-csv`
   - columns: `item_id` or `assembly`, `quantity`, optional `assembly_quantity,purpose,deadline,note,project_id`
+
+### Catalog search shortcut
+
+- Typed selector search for write flows: `GET /api/catalog/search?q=...&types=item,assembly,supplier,project`
+- `CatalogPicker` now powers Projects requirements, Assemblies components, BOM spreadsheet entry, Reservations entry, and Items/Orders/Movements/Reservations import reconciliation

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, Header, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .config import get_auth_mode
 from .db import get_connection, init_db
@@ -36,6 +37,7 @@ from .schemas import (
     PurchaseCandidatesFromBomRequest,
     PurchaseCandidatesFromProjectRequest,
     ProjectCreate,
+    ProjectRequirementPreviewRequest,
     ProjectRfqBatchCreateRequest,
     ProjectUpdate,
     RfqBatchUpdate,
@@ -56,6 +58,27 @@ def ok(data: Any, pagination: dict[str, Any] | None = None) -> dict[str, Any]:
     if pagination is not None:
         payload["pagination"] = pagination
     return payload
+
+
+def csv_attachment(filename: str, content: bytes) -> Response:
+    return Response(
+        content=content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+def _parse_optional_json_form(value: str | None, field_name: str) -> Any | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise AppError(
+            code="INVALID_REQUEST",
+            message=f"{field_name} must be valid JSON",
+            status_code=422,
+        ) from exc
 
 
 def _db_dep(app: FastAPI):
@@ -154,6 +177,23 @@ def create_app(db_path: str | None = None) -> FastAPI:
         data = service.dashboard_summary(conn)
         return ok(data)
 
+    @app.get("/api/catalog/search")
+    def get_catalog_search(
+        q: str,
+        types: str | None = None,
+        limit_per_type: int = 8,
+        conn= db,
+    ):
+        entity_types = [part.strip().lower() for part in str(types or "").split(",") if part.strip()]
+        return ok(
+            service.catalog_search(
+                conn,
+                q=q,
+                entity_types=entity_types or None,
+                limit_per_type=limit_per_type,
+            )
+        )
+
     @app.get("/api/items")
     def get_items(
         q: str | None = None,
@@ -183,6 +223,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def post_items_import(
         file: UploadFile = File(...),
         continue_on_error: bool = Form(default=True),
+        row_overrides: str | None = Form(default=None),
         conn= db,
     ):
         content = await file.read()
@@ -191,9 +232,33 @@ def create_app(db_path: str | None = None) -> FastAPI:
             content=content,
             source_name=file.filename or "items_import.csv",
             continue_on_error=continue_on_error,
+            row_overrides=_parse_optional_json_form(row_overrides, "row_overrides"),
         )
         conn.commit()
         return ok(result)
+
+    @app.post("/api/items/import-preview")
+    async def post_items_import_preview(
+        file: UploadFile = File(...),
+        conn= db,
+    ):
+        content = await file.read()
+        result = service.preview_items_import_from_content(
+            conn,
+            content=content,
+            source_name=file.filename or "items_import.csv",
+        )
+        return ok(result)
+
+    @app.get("/api/items/import-template")
+    def get_items_import_template():
+        filename, content = service.get_import_template_csv("items")
+        return csv_attachment(filename, content)
+
+    @app.get("/api/items/import-reference")
+    def get_items_import_reference(conn= db):
+        filename, content = service.get_items_import_reference_csv(conn)
+        return csv_attachment(filename, content)
 
     @app.get("/api/items/import-jobs")
     def get_items_import_jobs(
@@ -306,6 +371,7 @@ def create_app(db_path: str | None = None) -> FastAPI:
     async def post_inventory_import_csv(
         file: UploadFile = File(...),
         batch_id: str | None = Form(default=None),
+        row_overrides: str | None = Form(default=None),
         conn= db,
     ):
         content = await file.read()
@@ -313,9 +379,35 @@ def create_app(db_path: str | None = None) -> FastAPI:
             conn,
             content=content,
             batch_id=batch_id,
+            row_overrides=_parse_optional_json_form(row_overrides, "row_overrides"),
         )
         conn.commit()
         return ok(result)
+
+    @app.post("/api/inventory/import-preview")
+    async def post_inventory_import_preview(
+        file: UploadFile = File(...),
+        batch_id: str | None = Form(default=None),
+        conn= db,
+    ):
+        content = await file.read()
+        result = service.preview_inventory_movements_from_content(
+            conn,
+            content=content,
+            batch_id=batch_id,
+            source_name=file.filename or "inventory_import.csv",
+        )
+        return ok(result)
+
+    @app.get("/api/inventory/import-template")
+    def get_inventory_import_template():
+        filename, content = service.get_import_template_csv("inventory")
+        return csv_attachment(filename, content)
+
+    @app.get("/api/inventory/import-reference")
+    def get_inventory_import_reference(conn= db):
+        filename, content = service.get_inventory_import_reference_csv(conn)
+        return csv_attachment(filename, content)
 
     @app.post("/api/inventory/batch")
     def post_inventory_batch(body: InventoryBatchRequest, conn= db):
@@ -345,6 +437,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
             per_page=per_page,
         )
         return ok(data, pagination)
+
+    @app.get("/api/orders/import-template")
+    def get_orders_import_template():
+        filename, content = service.get_import_template_csv("orders")
+        return csv_attachment(filename, content)
+
+    @app.get("/api/orders/import-reference")
+    def get_orders_import_reference(supplier_name: str | None = None, conn= db):
+        filename, content = service.get_orders_import_reference_csv(
+            conn,
+            supplier_name=supplier_name,
+        )
+        return csv_attachment(filename, content)
 
     @app.get("/api/orders/{order_id}")
     def get_order(order_id: int, conn= db):
@@ -377,12 +482,33 @@ def create_app(db_path: str | None = None) -> FastAPI:
     def get_order_lineage(order_id: int, conn= db):
         return ok(service.list_order_lineage_events(conn, order_id=order_id))
 
+    @app.post("/api/orders/import-preview")
+    async def post_orders_import_preview(
+        file: UploadFile = File(...),
+        supplier_id: int | None = Form(default=None),
+        supplier_name: str | None = Form(default=None),
+        default_order_date: str | None = Form(default=None),
+        conn= db,
+    ):
+        content = await file.read()
+        result = service.preview_orders_import_from_content(
+            conn,
+            supplier_id=supplier_id,
+            supplier_name=supplier_name,
+            content=content,
+            default_order_date=default_order_date,
+            source_name=file.filename or "order_import.csv",
+        )
+        return ok(result)
+
     @app.post("/api/orders/import")
     async def post_orders_import(
         file: UploadFile = File(...),
         supplier_id: int | None = Form(default=None),
         supplier_name: str | None = Form(default=None),
         default_order_date: str | None = Form(default=None),
+        row_overrides: str | None = Form(default=None),
+        alias_saves: str | None = Form(default=None),
         conn= db,
     ):
         content = await file.read()
@@ -393,6 +519,8 @@ def create_app(db_path: str | None = None) -> FastAPI:
             content=content,
             default_order_date=default_order_date,
             source_name=file.filename or "order_import.csv",
+            row_overrides=_parse_optional_json_form(row_overrides, "row_overrides"),
+            alias_saves=_parse_optional_json_form(alias_saves, "alias_saves"),
         )
         conn.commit()
         return ok(result)
@@ -497,6 +625,16 @@ def create_app(db_path: str | None = None) -> FastAPI:
         conn.commit()
         return ok(result)
 
+    @app.get("/api/reservations/import-template")
+    def get_reservations_import_template():
+        filename, content = service.get_import_template_csv("reservations")
+        return csv_attachment(filename, content)
+
+    @app.get("/api/reservations/import-reference")
+    def get_reservations_import_reference(conn= db):
+        filename, content = service.get_reservations_import_reference_csv(conn)
+        return csv_attachment(filename, content)
+
     @app.put("/api/reservations/{reservation_id}")
     def put_reservation(reservation_id: int, body: ReservationUpdate, conn= db):
         result = service.update_reservation(conn, reservation_id, body.model_dump(exclude_unset=True))
@@ -537,11 +675,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/reservations/import-csv")
     async def post_reservations_import_csv(
         file: UploadFile = File(...),
+        row_overrides: str | None = Form(default=None),
         conn= db,
     ):
         content = await file.read()
-        result = service.import_reservations_from_content(conn, content=content)
+        result = service.import_reservations_from_content(
+            conn,
+            content=content,
+            row_overrides=_parse_optional_json_form(row_overrides, "row_overrides"),
+        )
         conn.commit()
+        return ok(result)
+
+    @app.post("/api/reservations/import-preview")
+    async def post_reservations_import_preview(
+        file: UploadFile = File(...),
+        conn= db,
+    ):
+        content = await file.read()
+        result = service.preview_reservations_from_content(
+            conn,
+            content=content,
+            source_name=file.filename or "reservations_import.csv",
+        )
         return ok(result)
 
     @app.post("/api/reservations/batch")
@@ -607,6 +763,10 @@ def create_app(db_path: str | None = None) -> FastAPI:
         result = service.create_project(conn, body.model_dump())
         conn.commit()
         return ok(result)
+
+    @app.post("/api/projects/requirements/preview")
+    def post_project_requirements_preview(body: ProjectRequirementPreviewRequest, conn= db):
+        return ok(service.preview_project_requirement_bulk_text(conn, text=body.text))
 
     @app.put("/api/projects/{project_id}")
     def put_project(project_id: int, body: ProjectUpdate, conn= db):
@@ -696,6 +856,15 @@ def create_app(db_path: str | None = None) -> FastAPI:
     @app.post("/api/bom/analyze")
     def post_bom_analyze(body: BomAnalyzeRequest, conn= db):
         result = service.analyze_bom_rows(
+            conn,
+            [row.model_dump() for row in body.rows],
+            target_date=body.target_date,
+        )
+        return ok(result)
+
+    @app.post("/api/bom/preview")
+    def post_bom_preview(body: BomAnalyzeRequest, conn= db):
+        result = service.preview_bom_rows(
             conn,
             [row.model_dump() for row in body.rows],
             target_date=body.target_date,

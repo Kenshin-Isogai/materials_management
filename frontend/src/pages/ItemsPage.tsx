@@ -1,8 +1,9 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import useSWR from "swr";
-import { apiGet, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
-import type { Item, MissingItemResolverRow } from "../lib/types";
+import { CatalogPicker } from "../components/CatalogPicker";
+import { apiDownload, apiGet, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import type { CatalogSearchResult, Item, MissingItemResolverRow } from "../lib/types";
 
 type ItemRowType = "item" | "alias";
 
@@ -39,6 +40,74 @@ type ItemImportResult = {
   import_job_id?: number;
   rows: ItemImportRow[];
 };
+
+type ItemImportPreviewMatch = CatalogSearchResult & {
+  confidence_score?: number | null;
+  match_reason?: string | null;
+};
+
+type ItemImportPreviewRow = {
+  row: number;
+  entry_type: "item" | "alias" | string;
+  item_number: string;
+  manufacturer_name: string;
+  supplier: string;
+  canonical_item_number: string;
+  units_per_order: string;
+  category: string;
+  url: string;
+  description: string;
+  status: "exact" | "high_confidence" | "needs_review" | "unresolved";
+  action: string;
+  message: string;
+  blocking: boolean;
+  requires_user_selection: boolean;
+  allowed_entity_types: Array<"item">;
+  suggested_match: ItemImportPreviewMatch | null;
+  candidates: ItemImportPreviewMatch[];
+};
+
+type ItemImportPreview = {
+  source_name: string;
+  summary: {
+    total_rows: number;
+    exact: number;
+    high_confidence: number;
+    needs_review: number;
+    unresolved: number;
+  };
+  blocking_errors: string[];
+  can_auto_accept: boolean;
+  rows: ItemImportPreviewRow[];
+};
+
+function itemPreviewMatchToCatalogResult(
+  match: ItemImportPreviewMatch
+): CatalogSearchResult {
+  return {
+    entity_type: "item",
+    entity_id: match.entity_id,
+    value_text: match.value_text,
+    display_label: match.display_label,
+    summary: match.summary,
+    match_source: match.match_source,
+  };
+}
+
+function previewStatusTone(status: ItemImportPreviewRow["status"]): string {
+  switch (status) {
+    case "exact":
+      return "bg-emerald-50 text-emerald-700";
+    case "high_confidence":
+      return "bg-sky-50 text-sky-700";
+    case "needs_review":
+      return "bg-amber-50 text-amber-700";
+    case "unresolved":
+      return "bg-red-50 text-red-700";
+    default:
+      return "bg-slate-100 text-slate-700";
+  }
+}
 
 type ItemImportJobSummary = {
   import_job_id: number;
@@ -222,34 +291,6 @@ function toMissingResolverRows(rows: MissingItemResolverRow[] | undefined): Miss
     .filter((row) => row.supplier && row.item_number);
 }
 
-function csvEscape(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, "\"\"")}"`;
-  }
-  return value;
-}
-
-function downloadTemplateCsv(
-  filename: string,
-  headers: string[],
-  sampleRows: Record<string, string>[]
-) {
-  const headerLine = headers.map(csvEscape).join(",");
-  const dataLines = sampleRows.map((sampleRow) =>
-    headers.map((key) => csvEscape(sampleRow[key] ?? "")).join(",")
-  );
-  const csv = `${headerLine}\n${dataLines.join("\n")}\n`;
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
-}
-
 export function ItemsPage() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -267,6 +308,11 @@ export function ItemsPage() {
   const [csvFile, setCsvFile] = useState<File | null>(null);
   const [csvMessage, setCsvMessage] = useState("");
   const [csvResult, setCsvResult] = useState<ItemImportResult | null>(null);
+  const [csvPreview, setCsvPreview] = useState<ItemImportPreview | null>(null);
+  const [csvPreviewSelections, setCsvPreviewSelections] = useState<
+    Record<number, CatalogSearchResult | null>
+  >({});
+  const [csvPreviewUnits, setCsvPreviewUnits] = useState<Record<number, string>>({});
   const [selectedImportJobId, setSelectedImportJobId] = useState<number | null>(null);
   const [importJobBusyId, setImportJobBusyId] = useState<number | null>(null);
   const [importJobsMessage, setImportJobsMessage] = useState("");
@@ -515,18 +561,148 @@ export function ItemsPage() {
     }
   }
 
-  async function importItemsCsv(event: FormEvent) {
+  function downloadImportCsv(path: string, fallbackFilename: string) {
+    void apiDownload(path, fallbackFilename).catch((error) => {
+      setCsvMessage(error instanceof Error ? error.message : String(error));
+    });
+  }
+
+  function resetCsvPreview() {
+    setCsvPreview(null);
+    setCsvPreviewSelections({});
+    setCsvPreviewUnits({});
+  }
+
+  function applyCsvPreview(preview: ItemImportPreview) {
+    const nextSelections: Record<number, CatalogSearchResult | null> = {};
+    const nextUnits: Record<number, string> = {};
+    for (const row of preview.rows) {
+      nextSelections[row.row] = row.suggested_match
+        ? itemPreviewMatchToCatalogResult(row.suggested_match)
+        : null;
+      nextUnits[row.row] = row.units_per_order || "1";
+    }
+    setCsvPreview(preview);
+    setCsvPreviewSelections(nextSelections);
+    setCsvPreviewUnits(nextUnits);
+  }
+
+  function selectedCsvPreviewMatch(
+    row: ItemImportPreviewRow
+  ): CatalogSearchResult | null {
+    const explicitSelection = csvPreviewSelections[row.row];
+    if (explicitSelection !== undefined) {
+      return explicitSelection;
+    }
+    if (!row.suggested_match) return null;
+    return itemPreviewMatchToCatalogResult(row.suggested_match);
+  }
+
+  function previewUnitsValue(row: ItemImportPreviewRow): string {
+    return csvPreviewUnits[row.row] ?? row.units_per_order ?? "1";
+  }
+
+  function canConfirmPreviewRow(row: ItemImportPreviewRow): boolean {
+    if (!row.blocking) return true;
+    if (row.action === "resolve_alias_canonical_item") {
+      return selectedCsvPreviewMatch(row) !== null;
+    }
+    if (
+      row.entry_type === "alias" &&
+      row.message === "units_per_order must be a positive integer"
+    ) {
+      const unitsValue = Number(previewUnitsValue(row));
+      return Number.isInteger(unitsValue) && unitsValue > 0;
+    }
+    return false;
+  }
+
+  async function previewItemsCsv(event: FormEvent) {
     event.preventDefault();
     if (!csvFile) return;
     setSubmitting(true);
     setCsvMessage("");
+    setCsvResult(null);
     setImportJobsMessage("");
+    resetCsvPreview();
+    try {
+      const form = new FormData();
+      form.append("file", csvFile);
+      const result = await apiSendForm<ItemImportPreview>("/items/import-preview", form);
+      applyCsvPreview(result);
+      setCsvMessage(
+        result.can_auto_accept
+          ? `Preview ready: ${result.summary.total_rows} row(s) are ready to import.`
+          : `Preview ready: review=${result.summary.needs_review}, unresolved=${result.summary.unresolved}.`
+      );
+    } catch (error) {
+      setCsvMessage(String(error instanceof Error ? error.message : error));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function confirmItemsPreview() {
+    if (!csvFile || !csvPreview) return;
+
+    for (const row of csvPreview.rows) {
+      if (row.entry_type !== "alias") continue;
+      const unitsValue = Number(previewUnitsValue(row));
+      if (!Number.isInteger(unitsValue) || unitsValue <= 0) {
+        setCsvMessage(`Row ${row.row}: units/order must be an integer greater than 0.`);
+        return;
+      }
+    }
+
+    const blockingRow = csvPreview.rows.find((row) => !canConfirmPreviewRow(row));
+    if (blockingRow) {
+      setCsvMessage(`Row ${blockingRow.row}: ${blockingRow.message}`);
+      return;
+    }
+
+    const rowOverrides: Record<
+      number,
+      { canonical_item_number?: string; units_per_order?: number }
+    > = {};
+
+    for (const row of csvPreview.rows) {
+      if (row.entry_type !== "alias") continue;
+      const selection = selectedCsvPreviewMatch(row);
+      const unitsValue = Number(previewUnitsValue(row));
+      const suggestedMatch = row.suggested_match;
+      const selectedItemNumber = selection?.value_text.trim();
+      const canonicalChanged = Boolean(
+        selectedItemNumber &&
+          (
+            row.action === "resolve_alias_canonical_item" ||
+            (suggestedMatch
+              ? selection?.entity_id !== suggestedMatch.entity_id
+              : selectedItemNumber !== row.canonical_item_number.trim())
+          )
+      );
+      const unitsChanged = String(unitsValue) !== String(row.units_per_order || "1");
+      if (!canonicalChanged && !unitsChanged) continue;
+      rowOverrides[row.row] = {};
+      if (canonicalChanged && selectedItemNumber) {
+        rowOverrides[row.row].canonical_item_number = selectedItemNumber;
+      }
+      if (unitsChanged) {
+        rowOverrides[row.row].units_per_order = unitsValue;
+      }
+    }
+
+    setSubmitting(true);
+    setCsvMessage("");
     try {
       const form = new FormData();
       form.append("file", csvFile);
       form.append("continue_on_error", "true");
+      if (Object.keys(rowOverrides).length > 0) {
+        form.append("row_overrides", JSON.stringify(rowOverrides));
+      }
       const result = await apiSendForm<ItemImportResult>("/items/import", form);
       setCsvResult(result);
+      resetCsvPreview();
       setCsvMessage(
         `CSV import: status=${result.status}, processed=${result.processed}, created=${result.created_count}, duplicates=${result.duplicate_count}, failed=${result.failed_count}`
       );
@@ -1338,67 +1514,208 @@ export function ItemsPage() {
             <code>units_per_order</code> (&gt; 0).
           </p>
           <p>Missing manufacturer defaults to <code>UNKNOWN</code>.</p>
-          <button
-            className="button-subtle mt-2"
-            type="button"
-            onClick={() =>
-              downloadTemplateCsv(
-                "items_import_template.csv",
-                [
-                  "row_type",
-                  "item_number",
-                  "manufacturer_name",
-                  "category",
-                  "url",
-                  "description",
-                  "supplier",
-                  "canonical_item_number",
-                  "units_per_order",
-                ],
-                [
-                  {
-                    row_type: "item",
-                    item_number: "LENS-001",
-                    manufacturer_name: "Thorlabs",
-                    category: "Lens",
-                    url: "https://example.com/lens-001",
-                    description: "Sample lens row",
-                    supplier: "",
-                    canonical_item_number: "",
-                    units_per_order: "",
-                  },
-                  {
-                    row_type: "alias",
-                    item_number: "ER2-P4",
-                    manufacturer_name: "",
-                    category: "",
-                    url: "",
-                    description: "",
-                    supplier: "Thorlabs",
-                    canonical_item_number: "ER2",
-                    units_per_order: "4",
-                  },
-                ]
-              )
-            }
-          >
-            Download Template CSV
-          </button>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              className="button-subtle"
+              type="button"
+              onClick={() => downloadImportCsv("/items/import-template", "items_import_template.csv")}
+            >
+              Download Template CSV
+            </button>
+            <button
+              className="button-subtle"
+              type="button"
+              onClick={() => downloadImportCsv("/items/import-reference", "items_import_reference.csv")}
+            >
+              Download Reference CSV
+            </button>
+          </div>
         </div>
 
-        <form className="mt-3 flex flex-wrap gap-3" onSubmit={importItemsCsv}>
+        <form className="mt-3 flex flex-wrap gap-3" onSubmit={previewItemsCsv}>
           <input
             className="input max-w-xl"
             type="file"
             accept=".csv,text/csv"
-            onChange={(e) => setCsvFile(e.target.files?.[0] ?? null)}
+            onChange={(e) => {
+              setCsvFile(e.target.files?.[0] ?? null);
+              setCsvResult(null);
+              resetCsvPreview();
+            }}
             required
           />
           <button className="button" disabled={submitting} type="submit">
-            Import Items CSV
+            Preview Import
           </button>
         </form>
         {csvMessage && <p className="mt-3 text-sm text-signal">{csvMessage}</p>}
+        {csvPreview && (
+          <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 p-3">
+            <div className="flex flex-wrap gap-2 text-xs">
+              <span className="rounded-full bg-emerald-50 px-3 py-1 font-semibold text-emerald-700">
+                Exact {csvPreview.summary.exact}
+              </span>
+              <span className="rounded-full bg-sky-50 px-3 py-1 font-semibold text-sky-700">
+                High Confidence {csvPreview.summary.high_confidence}
+              </span>
+              <span className="rounded-full bg-amber-50 px-3 py-1 font-semibold text-amber-700">
+                Review {csvPreview.summary.needs_review}
+              </span>
+              <span className="rounded-full bg-red-50 px-3 py-1 font-semibold text-red-700">
+                Unresolved {csvPreview.summary.unresolved}
+              </span>
+            </div>
+            <div className="mt-3 overflow-x-auto">
+              <table className="min-w-[1260px] text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-slate-500">
+                    <th className="px-2 py-2">Row</th>
+                    <th className="px-2 py-2">Type</th>
+                    <th className="px-2 py-2">Input</th>
+                    <th className="px-2 py-2">Resolved Canonical</th>
+                    <th className="px-2 py-2">Status</th>
+                    <th className="px-2 py-2">Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {csvPreview.rows.map((row) => (
+                    <tr key={row.row} className="border-b border-slate-100 align-top">
+                      <td className="px-2 py-3 font-semibold">#{row.row}</td>
+                      <td className="px-2 py-3">
+                        <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                          {row.entry_type}
+                        </span>
+                      </td>
+                      <td className="px-2 py-3">
+                        <div className="space-y-1">
+                          <p className="font-semibold text-slate-900">{row.item_number || "No item number"}</p>
+                          {row.entry_type === "item" ? (
+                            <>
+                              <p className="text-xs text-slate-500">{row.manufacturer_name}</p>
+                              {row.category && <p className="text-xs text-slate-500">{row.category}</p>}
+                            </>
+                          ) : (
+                            <>
+                              <p className="text-xs text-slate-500">supplier {row.supplier || "-"}</p>
+                              <p className="text-xs text-slate-500">
+                                canonical {row.canonical_item_number || "-"} | units {previewUnitsValue(row)}
+                              </p>
+                            </>
+                          )}
+                          {row.description && (
+                            <p className="text-xs text-slate-500">{row.description}</p>
+                          )}
+                        </div>
+                      </td>
+                      <td className="px-2 py-3">
+                        {selectedCsvPreviewMatch(row) ? (
+                          <div className="space-y-1">
+                            <p className="font-semibold text-slate-900">
+                              {selectedCsvPreviewMatch(row)?.display_label}
+                            </p>
+                            {selectedCsvPreviewMatch(row)?.summary && (
+                              <p className="text-xs text-slate-500">
+                                {selectedCsvPreviewMatch(row)?.summary}
+                              </p>
+                            )}
+                          </div>
+                        ) : row.suggested_match ? (
+                          <div className="space-y-1">
+                            <p className="font-semibold text-slate-900">
+                              {row.suggested_match.display_label}
+                            </p>
+                            {row.suggested_match.summary && (
+                              <p className="text-xs text-slate-500">{row.suggested_match.summary}</p>
+                            )}
+                            {row.suggested_match.match_reason && (
+                              <p className="text-xs text-slate-500">{row.suggested_match.match_reason}</p>
+                            )}
+                          </div>
+                        ) : row.entry_type === "item" ? (
+                          <p className="text-sm text-slate-500">Create new item</p>
+                        ) : (
+                          <p className="text-sm text-slate-500">
+                            {row.canonical_item_number || "Select canonical item"}
+                          </p>
+                        )}
+                      </td>
+                      <td className="px-2 py-3">
+                        <span
+                          className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${previewStatusTone(row.status)}`}
+                        >
+                          {row.status}
+                        </span>
+                      </td>
+                      <td className="px-2 py-3">
+                        <div className="space-y-2">
+                          <p className="text-xs text-slate-600">{row.message}</p>
+                          {row.entry_type === "alias" && (
+                            <div className="space-y-2">
+                              <CatalogPicker
+                                allowedTypes={["item"]}
+                                onChange={(value) =>
+                                  setCsvPreviewSelections((prev) => ({
+                                    ...prev,
+                                    [row.row]: value,
+                                  }))
+                                }
+                                placeholder="Select canonical item"
+                                recentKey="items-import-preview-canonical-item"
+                                seedQuery={row.canonical_item_number}
+                                value={selectedCsvPreviewMatch(row)}
+                              />
+                              <input
+                                className="input max-w-[180px]"
+                                min={1}
+                                onChange={(e) =>
+                                  setCsvPreviewUnits((prev) => ({
+                                    ...prev,
+                                    [row.row]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Units per order"
+                                step={1}
+                                type="number"
+                                value={previewUnitsValue(row)}
+                              />
+                              {row.candidates.length > 1 && (
+                                <p className="text-xs text-slate-500">
+                                  Candidates:{" "}
+                                  {row.candidates
+                                    .slice(0, 3)
+                                    .map((candidate) => candidate.display_label)
+                                    .join(" | ")}
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                className="button"
+                disabled={submitting}
+                onClick={() => void confirmItemsPreview()}
+                type="button"
+              >
+                Confirm Import
+              </button>
+              <button
+                className="button-subtle"
+                disabled={submitting}
+                onClick={resetCsvPreview}
+                type="button"
+              >
+                Clear Preview
+              </button>
+            </div>
+          </div>
+        )}
         {csvIssues.length > 0 && (
           <div className="mt-3 overflow-x-auto rounded-xl border border-amber-200 bg-amber-50 p-3">
             <p className="mb-2 text-sm font-semibold text-amber-900">Rows with issues</p>

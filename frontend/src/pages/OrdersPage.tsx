@@ -1,8 +1,15 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import useSWR from "swr";
-import { apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
-import type { Item, MissingItemResolverRow, Order, Quotation } from "../lib/types";
+import { CatalogPicker } from "../components/CatalogPicker";
+import { apiDownload, apiGetWithPagination, apiSend, apiSendForm } from "../lib/api";
+import type {
+  CatalogSearchResult,
+  Item,
+  MissingItemResolverRow,
+  Order,
+  Quotation,
+} from "../lib/types";
 
 const PENDING_MISSING_ITEMS_KEY = "mm.pending_missing_items";
 const PENDING_ORDER_IMPORT_KEY = "mm.pending_order_import";
@@ -46,7 +53,64 @@ type ImportResult = {
   imported_count?: number;
   missing_count?: number;
   missing_csv_path?: string;
+  saved_alias_count?: number;
   rows?: MissingItemResolverRow[];
+};
+
+type OrderImportPreviewStatus = "exact" | "high_confidence" | "needs_review" | "unresolved";
+
+type OrderImportPreviewMatch = {
+  item_id: number;
+  canonical_item_number: string;
+  manufacturer_name: string;
+  units_per_order: number;
+  display_label: string;
+  summary: string | null;
+  match_source: string;
+  match_reason: string;
+  confidence_score: number;
+};
+
+type OrderImportPreviewRow = {
+  row: number;
+  supplier_name: string;
+  item_number: string;
+  quantity: number;
+  quotation_number: string;
+  issue_date: string | null;
+  order_date: string;
+  expected_arrival: string | null;
+  pdf_link: string | null;
+  status: OrderImportPreviewStatus;
+  confidence_score: number | null;
+  suggested_match: OrderImportPreviewMatch | null;
+  candidates: OrderImportPreviewMatch[];
+  warnings: string[];
+  order_amount: number | null;
+};
+
+type OrderImportPreview = {
+  source_name: string;
+  supplier: {
+    supplier_id: number | null;
+    supplier_name: string;
+    exists: boolean;
+  };
+  thresholds: {
+    auto_accept: number;
+    review: number;
+  };
+  summary: {
+    total_rows: number;
+    exact: number;
+    high_confidence: number;
+    needs_review: number;
+    unresolved: number;
+  };
+  blocking_errors: string[];
+  duplicate_quotation_numbers: string[];
+  can_auto_accept: boolean;
+  rows: OrderImportPreviewRow[];
 };
 
 type BatchNormalization = {
@@ -99,42 +163,66 @@ type ImportBatchResult = {
   normalizations?: BatchNormalization[];
 };
 
-function csvEscape(value: string): string {
-  if (/[",\n\r]/.test(value)) {
-    return `"${value.replace(/"/g, "\"\"")}"`;
-  }
-  return value;
+function previewMatchToCatalogResult(match: OrderImportPreviewMatch): CatalogSearchResult {
+  return {
+    entity_type: "item",
+    entity_id: match.item_id,
+    value_text: match.canonical_item_number,
+    display_label: match.display_label,
+    summary: match.summary,
+    match_source: match.match_source,
+  };
 }
 
-function downloadTemplateCsv(
-  filename: string,
-  headers: string[],
-  sampleRow: Record<string, string>
-) {
-  const headerLine = headers.map(csvEscape).join(",");
-  const dataLine = headers.map((key) => csvEscape(sampleRow[key] ?? "")).join(",");
-  const csv = `${headerLine}\n${dataLine}\n`;
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  document.body.appendChild(anchor);
-  anchor.click();
-  anchor.remove();
-  URL.revokeObjectURL(url);
-};
+function normalizeCatalogValue(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+function previewStatusLabel(status: OrderImportPreviewStatus): string {
+  switch (status) {
+    case "exact":
+      return "Exact";
+    case "high_confidence":
+      return "High Confidence";
+    case "needs_review":
+      return "Needs Review";
+    case "unresolved":
+      return "Unresolved";
+    default:
+      return status;
+  }
+}
+
+function previewStatusTone(status: OrderImportPreviewStatus): string {
+  switch (status) {
+    case "exact":
+      return "bg-emerald-50 text-emerald-700";
+    case "high_confidence":
+      return "bg-sky-50 text-sky-700";
+    case "needs_review":
+      return "bg-amber-50 text-amber-700";
+    case "unresolved":
+      return "bg-red-50 text-red-700";
+    default:
+      return "bg-slate-100 text-slate-700";
+  }
+}
 
 export function OrdersPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const [supplier, setSupplier] = useState("");
+  const [supplierSelection, setSupplierSelection] = useState<CatalogSearchResult | null>(null);
   const [defaultDate, setDefaultDate] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [unregisteredRoot, setUnregisteredRoot] = useState("");
   const [registeredRoot, setRegisteredRoot] = useState("");
   const [message, setMessage] = useState<string>("");
   const [missingRows, setMissingRows] = useState<MissingItemResolverRow[]>([]);
+  const [importPreview, setImportPreview] = useState<OrderImportPreview | null>(null);
+  const [previewSelections, setPreviewSelections] = useState<Record<number, CatalogSearchResult | null>>({});
+  const [previewUnits, setPreviewUnits] = useState<Record<number, string>>({});
+  const [previewAliasSaves, setPreviewAliasSaves] = useState<Record<number, boolean>>({});
   const [batchMissingReports, setBatchMissingReports] = useState<UnregisteredFileReport[]>([]);
   const [batchErrorReports, setBatchErrorReports] = useState<BatchErrorReport[]>([]);
   const [batchWarnings, setBatchWarnings] = useState<string[]>([]);
@@ -350,9 +438,173 @@ export function OrdersPage() {
       }));
   }
 
-  async function submitImport(event: FormEvent) {
+  function resetImportPreview() {
+    setImportPreview(null);
+    setPreviewSelections({});
+    setPreviewUnits({});
+    setPreviewAliasSaves({});
+  }
+
+  function applyImportPreview(preview: OrderImportPreview) {
+    const nextSelections: Record<number, CatalogSearchResult | null> = {};
+    const nextUnits: Record<number, string> = {};
+    const nextAliasSaves: Record<number, boolean> = {};
+    for (const row of preview.rows) {
+      nextSelections[row.row] = row.suggested_match
+        ? previewMatchToCatalogResult(row.suggested_match)
+        : null;
+      nextUnits[row.row] = String(row.suggested_match?.units_per_order ?? 1);
+      nextAliasSaves[row.row] = false;
+    }
+    setImportPreview(preview);
+    setPreviewSelections(nextSelections);
+    setPreviewUnits(nextUnits);
+    setPreviewAliasSaves(nextAliasSaves);
+  }
+
+  function selectedPreviewMatch(row: OrderImportPreviewRow): CatalogSearchResult | null {
+    const explicitSelection = previewSelections[row.row];
+    if (explicitSelection !== undefined) {
+      return explicitSelection;
+    }
+    if (!row.suggested_match) return null;
+    return previewMatchToCatalogResult(row.suggested_match);
+  }
+
+  function previewUnitsValue(row: OrderImportPreviewRow): string {
+    return previewUnits[row.row] ?? String(row.suggested_match?.units_per_order ?? 1);
+  }
+
+  function canOfferAliasSave(
+    row: OrderImportPreviewRow,
+    selected: CatalogSearchResult | null
+  ): boolean {
+    if (!selected) return false;
+    return normalizeCatalogValue(row.item_number) !== normalizeCatalogValue(selected.value_text);
+  }
+
+  function unresolvedPreviewRows(): MissingItemResolverRow[] {
+    if (!importPreview) return [];
+    return importPreview.rows
+      .filter((row) => row.status === "unresolved" && !selectedPreviewMatch(row))
+      .map((row) => ({
+        row: row.row,
+        item_number: row.item_number,
+        supplier: row.supplier_name,
+        resolution_type: "new_item",
+        category: "",
+        url: "",
+        description: "",
+        canonical_item_number: "",
+        units_per_order: "",
+      }));
+  }
+
+  async function openPreviewMissingResolver() {
+    if (!file) return;
+    const unresolved = unresolvedPreviewRows();
+    if (!unresolved.length) return;
+    try {
+      await rememberPendingOrderImport(file);
+    } catch {
+      // Keep the resolver path available even if session storage write fails.
+    }
+    openMissingResolver(unresolved);
+  }
+
+  async function previewImport(event: FormEvent) {
     event.preventDefault();
     if (!file || !supplier.trim()) return;
+    setLoading(true);
+    setMessage("");
+    setMissingRows([]);
+    resetImportPreview();
+    sessionStorage.removeItem(PENDING_BATCH_RETRY_KEY);
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      if (supplierSelection) {
+        form.append("supplier_id", String(supplierSelection.entity_id));
+      } else {
+        form.append("supplier_name", supplier);
+      }
+      if (defaultDate.trim()) form.append("default_order_date", defaultDate.trim());
+      const result = await apiSendForm<OrderImportPreview>("/orders/import-preview", form);
+      applyImportPreview(result);
+      setMessage(
+        result.can_auto_accept
+          ? `Preview ready: ${result.summary.total_rows} row(s) are auto-acceptable.`
+          : `Preview ready: ${result.summary.total_rows} row(s), review=${result.summary.needs_review}, unresolved=${result.summary.unresolved}.`
+      );
+    } catch (error) {
+      const messageText = String(error ?? "");
+      if (messageText.includes("quotations/registered/pdf_files")) {
+        setMessage(
+          "Preview failed: Manual import requires pdf_link to be blank, filename-only, or quotations/registered/pdf_files/<supplier>/<file>.pdf. " +
+          "For unregistered folder CSV files, use 'Unregistered Folder Batch'."
+        );
+      } else {
+        setMessage(`Preview failed: ${messageText}`);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function confirmImportPreview() {
+    if (!file || !supplier.trim() || !importPreview) return;
+    if (importPreview.blocking_errors.length > 0) {
+      setMessage(importPreview.blocking_errors[0]);
+      return;
+    }
+
+    const unresolvedRows = importPreview.rows.filter((row) => !selectedPreviewMatch(row));
+    if (unresolvedRows.length > 0) {
+      setMessage(
+        `Resolve preview rows before import: ${unresolvedRows.map((row) => row.row).join(", ")}`
+      );
+      return;
+    }
+
+    const rowOverrides: Record<number, { item_id: number; units_per_order: number }> = {};
+    const aliasSaves: Array<{
+      ordered_item_number: string;
+      item_id: number;
+      units_per_order: number;
+    }> = [];
+
+    for (const row of importPreview.rows) {
+      const selection = selectedPreviewMatch(row);
+      if (!selection) continue;
+      const unitsValue = Number(previewUnitsValue(row));
+      if (!Number.isInteger(unitsValue) || unitsValue <= 0) {
+        setMessage(`Row ${row.row}: units/order must be an integer greater than 0.`);
+        return;
+      }
+
+      const suggested = row.suggested_match;
+      const requiresOverride =
+        row.status !== "exact" ||
+        suggested == null ||
+        suggested.item_id !== selection.entity_id ||
+        suggested.units_per_order !== unitsValue;
+
+      if (requiresOverride) {
+        rowOverrides[row.row] = {
+          item_id: selection.entity_id,
+          units_per_order: unitsValue,
+        };
+      }
+
+      if (previewAliasSaves[row.row] && canOfferAliasSave(row, selection)) {
+        aliasSaves.push({
+          ordered_item_number: row.item_number,
+          item_id: selection.entity_id,
+          units_per_order: unitsValue,
+        });
+      }
+    }
+
     setLoading(true);
     setMessage("");
     setMissingRows([]);
@@ -360,8 +612,19 @@ export function OrdersPage() {
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("supplier_name", supplier);
+      if (supplierSelection) {
+        form.append("supplier_id", String(supplierSelection.entity_id));
+      } else {
+        form.append("supplier_name", supplier);
+      }
       if (defaultDate.trim()) form.append("default_order_date", defaultDate.trim());
+      if (Object.keys(rowOverrides).length > 0) {
+        form.append("row_overrides", JSON.stringify(rowOverrides));
+      }
+      if (aliasSaves.length > 0) {
+        form.append("alias_saves", JSON.stringify(aliasSaves));
+      }
+
       const result = await apiSendForm<ImportResult>("/orders/import", form);
       if (result.status === "missing_items") {
         const unresolved = normalizeMissingRows(result.rows, supplier.trim());
@@ -376,11 +639,17 @@ export function OrdersPage() {
         );
         openMissingResolver(unresolved);
       } else {
+        resetImportPreview();
         setMissingRows([]);
         sessionStorage.removeItem(PENDING_MISSING_ITEMS_KEY);
         sessionStorage.removeItem(PENDING_ORDER_IMPORT_KEY);
         sessionStorage.removeItem(PENDING_BATCH_RETRY_KEY);
-        setMessage(`Imported ${result.imported_count ?? 0} rows.`);
+        const savedAliasCount = result.saved_alias_count ?? 0;
+        setMessage(
+          savedAliasCount > 0
+            ? `Imported ${result.imported_count ?? 0} rows and saved ${savedAliasCount} alias mapping(s).`
+            : `Imported ${result.imported_count ?? 0} rows.`
+        );
       }
       await Promise.all([mutateOrders(), mutateQuotations()]);
     } catch (error) {
@@ -396,6 +665,12 @@ export function OrdersPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function downloadImportCsv(path: string, fallbackFilename: string) {
+    void apiDownload(path, fallbackFilename).catch((error) => {
+      setMessage(error instanceof Error ? error.message : String(error));
+    });
   }
 
   async function markArrived(orderId: number) {
@@ -654,62 +929,276 @@ export function OrdersPage() {
             If you provide only a filename like <code>Q-2026-001.pdf</code>, it is auto-normalized
             to the canonical registered path for the selected supplier.
           </p>
-          <button
-            className="button-subtle mt-2"
-            type="button"
-            onClick={() =>
-              downloadTemplateCsv(
-                "order_import_template.csv",
-                [
-                  "item_number",
-                  "quantity",
-                  "quotation_number",
-                  "issue_date",
-                  "order_date",
-                  "expected_arrival",
-                  "pdf_link"
-                ],
-                {
-                  item_number: "LENS-001",
-                  quantity: "5",
-                  quotation_number: "Q-2026-001",
-                  issue_date: "2026-02-23",
-                  order_date: "2026-02-23",
-                  expected_arrival: "2026-03-01",
-                  pdf_link: "quotations/registered/pdf_files/Thorlabs/Q-2026-001.pdf"
-                }
-              )
-            }
-          >
-            Download Template CSV
-          </button>
+          <div className="mt-2 flex flex-wrap gap-2">
+            <button
+              className="button-subtle"
+              type="button"
+              onClick={() => downloadImportCsv("/orders/import-template", "orders_import_template.csv")}
+            >
+              Download Template CSV
+            </button>
+            <button
+              className="button-subtle"
+              type="button"
+              onClick={() => {
+                const query = supplier.trim()
+                  ? `?supplier_name=${encodeURIComponent(supplier.trim())}`
+                  : "";
+                downloadImportCsv(
+                  `/orders/import-reference${query}`,
+                  "orders_import_reference.csv"
+                );
+              }}
+            >
+              Download Reference CSV
+            </button>
+          </div>
         </div>
-        <form className="grid gap-3 md:grid-cols-4" onSubmit={submitImport}>
-          <input
-            className="input"
-            placeholder="Supplier name"
-            value={supplier}
-            onChange={(e) => setSupplier(e.target.value)}
-            required
+        <form className="grid gap-3 md:grid-cols-4" onSubmit={previewImport}>
+          <CatalogPicker
+            allowedTypes={["supplier"]}
+            onChange={(value) => {
+              setSupplierSelection(value);
+              setSupplier(value?.value_text ?? "");
+              resetImportPreview();
+            }}
+            onQueryChange={(value) => {
+              setSupplier(value);
+              if (supplierSelection && value !== supplierSelection.value_text) {
+                setSupplierSelection(null);
+              }
+              resetImportPreview();
+            }}
+            placeholder="Type or search supplier"
+            recentKey="orders-import-supplier"
+            seedQuery={supplier}
+            value={supplierSelection}
           />
           <input
             className="input"
             type="date"
             value={defaultDate}
-            onChange={(e) => setDefaultDate(e.target.value)}
+            onChange={(e) => {
+              setDefaultDate(e.target.value);
+              resetImportPreview();
+            }}
           />
           <input
             className="input"
             type="file"
             accept=".csv,text/csv"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+            onChange={(e) => {
+              setFile(e.target.files?.[0] ?? null);
+              resetImportPreview();
+            }}
             required
           />
           <button className="button" disabled={loading} type="submit">
-            Import
+            Preview Import
           </button>
         </form>
         {message && <p className="mt-3 text-sm text-signal">{message}</p>}
+        {importPreview && (
+          <div className="mt-4 space-y-3 rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-slate-900">Import Preview</p>
+                <p className="mt-1 text-xs text-slate-600">
+                  Supplier context:{" "}
+                  <strong>{importPreview.supplier.supplier_name}</strong>
+                  {importPreview.supplier.exists ? " (existing supplier)" : " (new supplier on commit)"}
+                </p>
+              </div>
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="rounded-full bg-emerald-50 px-3 py-1 font-semibold text-emerald-700">
+                  Exact {importPreview.summary.exact}
+                </span>
+                <span className="rounded-full bg-sky-50 px-3 py-1 font-semibold text-sky-700">
+                  High {importPreview.summary.high_confidence}
+                </span>
+                <span className="rounded-full bg-amber-50 px-3 py-1 font-semibold text-amber-700">
+                  Review {importPreview.summary.needs_review}
+                </span>
+                <span className="rounded-full bg-red-50 px-3 py-1 font-semibold text-red-700">
+                  Unresolved {importPreview.summary.unresolved}
+                </span>
+              </div>
+            </div>
+
+            {importPreview.blocking_errors.length > 0 && (
+              <div className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-800">
+                {importPreview.blocking_errors.map((errorText, index) => (
+                  <p key={`${errorText}-${index}`}>{errorText}</p>
+                ))}
+              </div>
+            )}
+
+            {unresolvedPreviewRows().length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                <button
+                  className="button-subtle"
+                  type="button"
+                  onClick={() => void openPreviewMissingResolver()}
+                >
+                  Open Missing Resolver In Items
+                </button>
+                <p className="self-center text-xs text-slate-500">
+                  Use this only when the required canonical item is not in the catalog yet.
+                </p>
+              </div>
+            )}
+
+            <div className="overflow-x-auto">
+              <table className="min-w-[1100px] text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-left text-slate-500">
+                    <th className="px-2 py-2">Row</th>
+                    <th className="px-2 py-2">Raw Input</th>
+                    <th className="px-2 py-2">Suggested Canonical Match</th>
+                    <th className="px-2 py-2">Confidence</th>
+                    <th className="px-2 py-2">Status</th>
+                    <th className="px-2 py-2">User Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {importPreview.rows.map((row) => {
+                    const selection = selectedPreviewMatch(row);
+                    const canSaveAlias = canOfferAliasSave(row, selection);
+                    return (
+                      <tr key={row.row} className="border-b border-slate-100 align-top">
+                        <td className="px-2 py-3 font-semibold text-slate-700">#{row.row}</td>
+                        <td className="px-2 py-3">
+                          <div className="space-y-1">
+                            <p className="font-semibold text-slate-900">{row.item_number}</p>
+                            <p className="text-xs text-slate-500">
+                              qty {row.quantity} | quotation {row.quotation_number}
+                            </p>
+                            <p className="text-xs text-slate-500">
+                              order {row.order_date}
+                              {row.expected_arrival ? ` | eta ${row.expected_arrival}` : ""}
+                            </p>
+                            {row.pdf_link && (
+                              <p className="text-xs text-slate-500">{row.pdf_link}</p>
+                            )}
+                            {row.warnings.map((warning, index) => (
+                              <p key={`${warning}-${index}`} className="text-xs font-semibold text-red-600">
+                                {warning}
+                              </p>
+                            ))}
+                          </div>
+                        </td>
+                        <td className="px-2 py-3">
+                          {row.suggested_match ? (
+                            <div className="space-y-1">
+                              <p className="font-semibold text-slate-900">
+                                {row.suggested_match.display_label}
+                              </p>
+                              <p className="text-xs text-slate-500">
+                                units/order {row.suggested_match.units_per_order}
+                              </p>
+                              {row.suggested_match.summary && (
+                                <p className="text-xs text-slate-500">
+                                  {row.suggested_match.summary}
+                                </p>
+                              )}
+                              {row.candidates.length > 1 && (
+                                <p className="text-xs text-slate-400">
+                                  {row.candidates.length} ranked candidates available
+                                </p>
+                              )}
+                            </div>
+                          ) : (
+                            <p className="text-sm text-slate-500">No confident suggestion</p>
+                          )}
+                        </td>
+                        <td className="px-2 py-3">
+                          {row.confidence_score == null ? "-" : `${row.confidence_score}%`}
+                        </td>
+                        <td className="px-2 py-3">
+                          <span
+                            className={`inline-flex rounded-full px-3 py-1 text-xs font-semibold ${previewStatusTone(row.status)}`}
+                          >
+                            {previewStatusLabel(row.status)}
+                          </span>
+                        </td>
+                        <td className="px-2 py-3">
+                          <div className="space-y-2">
+                            <CatalogPicker
+                              allowedTypes={["item"]}
+                              onChange={(value) =>
+                                setPreviewSelections((prev) => ({
+                                  ...prev,
+                                  [row.row]: value,
+                                }))
+                              }
+                              placeholder="Search canonical item"
+                              recentKey="orders-import-preview-item"
+                              value={selection ?? null}
+                            />
+                            <div className="flex flex-wrap gap-2">
+                              <input
+                                className="input w-28"
+                                min={1}
+                                type="number"
+                                value={previewUnitsValue(row)}
+                                onChange={(event) =>
+                                  setPreviewUnits((prev) => ({
+                                    ...prev,
+                                    [row.row]: event.target.value,
+                                  }))
+                                }
+                              />
+                              <span className="self-center text-xs text-slate-500">
+                                units/order
+                              </span>
+                            </div>
+                            {canSaveAlias && (
+                              <label className="flex items-center gap-2 text-xs text-slate-600">
+                                <input
+                                  checked={previewAliasSaves[row.row] ?? false}
+                                  onChange={(event) =>
+                                    setPreviewAliasSaves((prev) => ({
+                                      ...prev,
+                                      [row.row]: event.target.checked,
+                                    }))
+                                  }
+                                  type="checkbox"
+                                />
+                                Save supplier alias after import
+                              </label>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="button"
+                disabled={loading || importPreview.blocking_errors.length > 0}
+                onClick={() => void confirmImportPreview()}
+                type="button"
+              >
+                Confirm Import
+              </button>
+              <button
+                className="button-subtle"
+                disabled={loading}
+                onClick={resetImportPreview}
+                type="button"
+              >
+                Clear Preview
+              </button>
+              <p className="self-center text-xs text-slate-500">
+                High-confidence rows can be confirmed directly; review and unresolved rows can be adjusted here before commit.
+              </p>
+            </div>
+          </div>
+        )}
         {missingRows.length > 0 && (
           <div className="mt-3 rounded-xl border border-amber-200 bg-amber-50 p-3">
             <p className="mb-2 text-sm font-semibold text-amber-900">

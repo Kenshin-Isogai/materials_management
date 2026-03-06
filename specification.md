@@ -592,22 +592,34 @@ Maps raw category names to canonical category names for soft-merge behavior.
 
 **Order Import:**
 1. User selects supplier and uploads CSV
-2. System resolves each CSV `item_number`:
+2. Manual Orders UI first calls `POST /orders/import-preview`
+   - classify each row as `exact`, `high_confidence`, `needs_review`, or `unresolved`
+   - prefer direct item-number and supplier-alias matches before fuzzy ranking
+   - surface duplicate quotation conflicts before commit without creating a supplier during preview
+3. Preview confirmation may send optional per-row `row_overrides` (`item_id`, `units_per_order`)
+   plus optional `alias_saves` for reusable supplier-scoped ordered names
+4. System resolves each CSV `item_number`:
    - direct match in `items_master`, or
    - alias match in `supplier_item_aliases` (`ordered_item_number -> canonical_item_id`)
-3. Quantity conversion:
+   - or preview-provided override item when confirmation selected a canonical target manually
+5. Quantity conversion:
    - direct match: `order_amount = quantity`
    - alias match: `order_amount = quantity * units_per_order`
-4. If unresolved items remain: generate `missing_items_registration.csv` and return `status="missing_items"` (no orders inserted yet)
-5. User registers missing items (new item or alias) and re-runs order import with the same CSV
+   - preview override uses the selected `units_per_order` (default `1` when not specified)
+6. If unresolved items remain: generate `missing_items_registration.csv` and return `status="missing_items"` (no orders inserted yet)
+7. User registers missing items (new item or alias) and re-runs order import with the same CSV
    - Missing-item registration supports mixed batches: alias rows may reference canonical rows created as `new_item` in the same file
-6. If all rows resolve, insert orders into `orders` and keep traceability fields
+8. If all rows resolve, insert orders into `orders` and keep traceability fields
    (`ordered_item_number`, `ordered_quantity`)
    - Reject import when the same `(supplier, quotation_number)` already has existing orders
      to prevent duplicate quotation re-import
-7. Normalize date fields to `YYYY-MM-DD`; reject invalid date strings
-8. For manual CSV import, `pdf_link` must be blank or `quotations/registered/pdf_files/<supplier>/<file>.pdf`
+   - apply requested alias saves only after duplicate-quotation checks pass
+9. Normalize date fields to `YYYY-MM-DD`; reject invalid date strings
+10. For manual CSV import, `pdf_link` must be blank or `quotations/registered/pdf_files/<supplier>/<file>.pdf`
    - Filename-only values are normalized to the selected supplier's registered path
+11. Import-capable CSV workflows expose companion downloads:
+   - template CSV: header-only exact import columns, UTF-8 with BOM
+   - reference CSV: live canonical DB values relevant to that flow, generated on demand from current state
 
 **Batch Procedure (Unregistered Folder):**
 1. Scan all `*.csv` under `quotations/unregistered/csv_files`
@@ -788,11 +800,27 @@ Projected Available =
 
 
 
-### **4.8.1 Movement/Reservation CSV Import**
+### **4.8.1 CSV Import Preview/Reconciliation**
 
+- Manual CSV imports are preview-first before commit for items, inventory, orders, and reservations.
+- Projects quick requirement parsing is also preview-first before rows are applied into project requirements.
+  - `POST /projects/requirements/preview` parses `item_number,quantity` text lines, classifies item matches as `exact`, `high_confidence`, `needs_review`, or `unresolved`, and returns ranked item candidates for correction
+  - preview-confirmed project rows are applied client-side into the editable requirements grid; project create/update contracts remain unchanged
+- Items preview:
+  - `POST /items/import-preview` classifies item rows as create-vs-duplicate and alias rows as create/update/review/unresolved
+  - preview confirmation may send optional per-row `row_overrides` (`canonical_item_number`, `units_per_order`) to `POST /items/import`
+- Inventory preview:
+  - `POST /inventory/import-preview` validates operation/location requirements, simulates stock effects in CSV order, and flags unresolved `item_id` values or stock shortages before commit
+  - preview confirmation may send optional per-row `row_overrides` (`item_id`) to `POST /inventory/import-csv`
 - Inventory movement CSV import supports `MOVE`, `CONSUME`, `ADJUST`, `ARRIVAL`, `RESERVE` operation rows and executes them via the existing batch transaction service.
+- Reservation preview:
+  - `POST /reservations/import-preview` validates direct item or assembly targets, previews assembly expansion, and flags inventory shortages before commit
+  - preview confirmation may send optional per-row `row_overrides` (`item_id` or `assembly_id`) to `POST /reservations/import-csv`
 - Reservation CSV import supports either direct `item_id` reservations or assembly-driven rows (`assembly` + optional `assembly_quantity`) that expand to component reservations using assembly definitions.
 - Assembly expansion is intentionally advisory/planning-oriented (no automatic inventory movement beyond reservation allocation), which aligns with current assembly policy and avoids unnecessary complexity.
+- Items, inventory, orders, and reservations CSV workflows each expose:
+  - `GET .../import-template` for header-only UTF-8-with-BOM templates
+  - `GET .../import-reference` for live reference CSV generated from current canonical data
 
 ### **4.9 Inventory Snapshots**
 
@@ -896,11 +924,21 @@ Base URL: `http://localhost:8000/api`
 |--------|----------|-------------|
 | GET | `/auth/capabilities` | Return runtime auth mode and planned RBAC roles metadata |
 
+#### **Catalog Search**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/catalog/search` | Search typed catalog entities for write-flow selectors (`?q=...&types=item,assembly,supplier,project&limit_per_type=8`) |
+
 #### **Items**
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/items` | List items (supports `?q=`, `?category=`, `?manufacturer=`, pagination) |
+| GET | `/items/import-template` | Download header-only item import template CSV (UTF-8 with BOM) |
+| GET | `/items/import-reference` | Download live item/alias reference CSV |
+| POST | `/items/import-preview` | Preview item/alias CSV reconciliation before commit |
+| POST | `/items/import` | Import items and supplier-scoped aliases from CSV; accepts optional preview-confirmation `row_overrides` (`canonical_item_number`, `units_per_order`) |
 | GET | `/items/{item_id}` | Get item details |
 | POST | `/items` | Create item |
 | PUT | `/items/{item_id}` | Update item |
@@ -913,22 +951,29 @@ Base URL: `http://localhost:8000/api`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/inventory` | List inventory by location |
+| GET | `/inventory/import-template` | Download header-only movement import template CSV (UTF-8 with BOM) |
+| GET | `/inventory/import-reference` | Download live movement reference CSV (item ids and current locations/quantities) |
+| POST | `/inventory/import-preview` | Preview movement CSV validation and simulated stock effects before commit |
 | GET | `/inventory/snapshot` | Get inventory snapshot (supports `?date=`, `?mode=past|future`) |
 | POST | `/inventory/move` | Move items between locations |
 | POST | `/inventory/consume` | Consume items from location |
 | POST | `/inventory/adjust` | Adjust inventory quantity |
 | POST | `/inventory/batch` | Batch movement operations |
+| POST | `/inventory/import-csv` | Import movement operations from CSV; accepts optional preview-confirmation `row_overrides` (`item_id`) |
 
 #### **Orders & Quotations**
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/orders` | List orders (supports `?status=`, `?supplier=`; includes optional `project_id`) |
+| GET | `/orders/import-template` | Download header-only order import template CSV (UTF-8 with BOM) |
+| GET | `/orders/import-reference` | Download live order reference CSV; supports optional `?supplier_name=` to scope alias rows |
+| POST | `/orders/import-preview` | Preview order CSV reconciliation, classify rows, and surface duplicate quotation conflicts before commit |
 | GET | `/orders/{order_id}` | Get order details |
 | PUT | `/orders/{order_id}` | Update order ETA, project assignment for non-RFQ-managed orders, or split partial ETA via `split_quantity` |
 | POST | `/orders/merge` | Merge two open compatible orders |
 | GET | `/orders/{order_id}/lineage` | List split/merge lineage events for the order |
-| POST | `/orders/import` | Import orders from CSV |
+| POST | `/orders/import` | Import orders from CSV; accepts optional preview-confirmation `row_overrides` and `alias_saves` form fields |
 | POST | `/orders/{order_id}/arrival` | Process order arrival |
 | POST | `/orders/{order_id}/partial-arrival` | Process partial arrival |
 | GET | `/quotations` | List quotations |
@@ -939,11 +984,15 @@ Base URL: `http://localhost:8000/api`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | GET | `/reservations` | List reservations (supports `?status=`, `?item_id=`) |
+| GET | `/reservations/import-template` | Download header-only reservation import template CSV (UTF-8 with BOM) |
+| GET | `/reservations/import-reference` | Download live reservation reference CSV (items, assemblies, projects) |
+| POST | `/reservations/import-preview` | Preview reservation CSV target resolution and stock availability before commit |
 | POST | `/reservations` | Create reservation |
 | PUT | `/reservations/{reservation_id}` | Update reservation |
 | POST | `/reservations/{reservation_id}/release` | Release reservation (full or partial using optional `quantity`) |
 | POST | `/reservations/{reservation_id}/consume` | Consume reservation (full or partial using optional `quantity`) |
 | POST | `/reservations/batch` | Batch create reservations |
+| POST | `/reservations/import-csv` | Import reservation rows from CSV; accepts optional preview-confirmation `row_overrides` (`item_id` or `assembly_id`) |
 
 #### **Assemblies**
 
@@ -963,6 +1012,7 @@ Base URL: `http://localhost:8000/api`
 |--------|----------|-------------|
 | GET | `/projects` | List projects |
 | GET | `/projects/{project_id}` | Get project with requirements |
+| POST | `/projects/requirements/preview` | Preview `item_number,quantity` quick-entry lines before applying them to project requirements |
 | POST | `/projects` | Create project |
 | PUT | `/projects/{project_id}` | Update project |
 | DELETE | `/projects/{project_id}` | Delete project |

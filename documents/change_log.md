@@ -16,6 +16,33 @@
   - Orders now have optional `project_id`.
   - Project-linked orders are excluded from the generic future-arrival pool and treated as dedicated supply for that project.
   - Orders page now displays project assignment so dedicated supply is visible to the operator.
+- Added phase-1 import UX support for current CSV workflows.
+  - Added `GET /api/items|inventory|orders|reservations/import-template` endpoints that return header-only UTF-8-with-BOM template CSVs.
+  - Added `GET /api/items|inventory|orders|reservations/import-reference` endpoints that return live reference CSVs generated from current DB state.
+  - Orders import reference now supports optional `supplier_name` scoping so alias rows match the selected supplier context.
+  - Frontend import areas on Items, Orders, Movements, and Reservations now download templates/reference data from the backend instead of generating sample CSVs client-side.
+  - Table headers now remain sticky inside the existing horizontally scrollable table wrappers to improve browse-mode scanability on major table pages.
+- Added the catalog search foundation and first `CatalogPicker` rollout.
+  - Added `GET /api/catalog/search` with typed item/assembly/supplier/project results for write-flow selectors.
+  - Item search now considers supplier alias text in addition to canonical item metadata.
+  - Added reusable frontend `CatalogPicker` with grouped results, keyboard navigation, and `localStorage` recent selections.
+  - Projects page requirement rows now use `CatalogPicker` for item and assembly selection.
+  - Assemblies page component rows now use `CatalogPicker` for item selection.
+- Extended the `CatalogPicker` rollout and added the first import preview flow.
+  - BOM spreadsheet entry now uses `CatalogPicker` in type-or-search mode for supplier and item cells.
+  - Reservations entry now uses `CatalogPicker` for item selection.
+  - Orders manual import supplier selection now uses `CatalogPicker`.
+  - Added `POST /api/orders/import-preview` plus preview-confirmation support on `POST /api/orders/import` via `row_overrides` and `alias_saves`.
+  - Orders page manual import now previews reconciliation status, ranked suggestions, duplicate quotation conflicts, and optional alias-save checkboxes before commit.
+- Extended preview-first CSV import to the remaining manual flows.
+  - Added `POST /api/items/import-preview`, `POST /api/inventory/import-preview`, and `POST /api/reservations/import-preview`.
+  - Added preview-confirmation `row_overrides` support on `POST /api/items/import`, `POST /api/inventory/import-csv`, and `POST /api/reservations/import-csv`.
+  - Items page now previews duplicate item rows, alias create/update behavior, canonical-item correction, and units-per-order overrides before import.
+  - Movements page now previews row validation, sequential stock effects, and unresolved item corrections before import.
+  - Reservations page now previews item/assembly target resolution, assembly expansion, stock shortages, and manual target correction before import.
+- Added the next CR1 reconciliation slice for Projects quick-entry parsing.
+  - Added `POST /api/projects/requirements/preview` for `item_number,quantity` bulk text parsing.
+  - Projects page quick parser now previews exact/high-confidence/review/unresolved matches, uses `CatalogPicker` for manual correction, and then applies the result into editable project requirement rows.
 
 ### Fixed
 
@@ -42,6 +69,9 @@
 - Updated `specification.md` with RFQ tables, project-linked order semantics, planning endpoint contracts, revised project planning behavior, and the RFQ-owned order assignment guardrails.
 - Updated `documents/technical_documentation.md` with the sequential planning pipeline, RFQ architecture, and RFQ/order ownership invariants.
 - Updated `documents/source_current_state.md` with the current Planning/RFQ behavior, including stale-link clearing and RFQ-owned order assignment rules.
+- Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with the CSV template/reference download endpoints and sticky-table UI behavior.
+- Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with preview-first item/movement/reservation CSV import behavior and endpoint contracts.
+- Updated `README.md`, `specification.md`, `documents/technical_documentation.md`, and `documents/source_current_state.md` with the new Projects quick-parser preview endpoint and workflow.
 
 ### Tests
 
@@ -54,7 +84,20 @@
 - Added backend regression coverage for:
   - blocking manual order `project_id` reassignment when an `ORDERED` RFQ line owns the order
   - clearing stale `linked_order_id` values when RFQ lines are saved back to non-`ORDERED` states
-- Backend suite executed: `uv run python -m pytest -q` -> `95 passed`.
+- Added backend integration coverage for:
+  - header-only BOM template CSV downloads for items, inventory, orders, and reservations
+  - live reference CSV downloads for items, inventory, orders, and reservations
+- Added backend integration coverage for catalog search:
+  - typed result payloads across item/assembly/project search
+  - item alias matches
+  - invalid type rejection
+- Added backend integration coverage for orders import preview / preview-confirmation override flow.
+- Added backend integration coverage for:
+  - items import preview and alias override confirmation
+  - inventory import preview and preview-confirmation item overrides
+  - reservations import preview and preview-confirmation target overrides
+- Added backend integration coverage for project requirement quick-parser preview.
+- Backend suite executed: `uv run python -m pytest -q` -> `112 passed`.
 - Frontend production build executed: `npm.cmd run build`.
 
 ## 2026-03-05

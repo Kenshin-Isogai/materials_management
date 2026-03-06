@@ -70,6 +70,23 @@ async function fetchApi(path: string, init?: RequestInit): Promise<Response> {
   );
 }
 
+function extractFilename(
+  contentDisposition: string | null,
+  fallbackFilename: string
+): string {
+  if (!contentDisposition) return fallbackFilename;
+  const utf8Match = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    try {
+      return decodeURIComponent(utf8Match[1]);
+    } catch {
+      return utf8Match[1];
+    }
+  }
+  const filenameMatch = contentDisposition.match(/filename="?([^"]+)"?/i);
+  return filenameMatch?.[1] ?? fallbackFilename;
+}
+
 async function parseJson<T>(res: Response): Promise<ApiResponse<T>> {
   const text = await res.text();
   try {
@@ -141,4 +158,29 @@ export async function apiSendForm<T>(
     );
   }
   return payload.data;
+}
+
+export async function apiDownload(path: string, fallbackFilename: string): Promise<void> {
+  const res = await fetchApi(path);
+  if (!res.ok) {
+    const contentType = res.headers.get("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const payload = await parseJson<unknown>(res);
+      throw new Error(
+        payload.status === "error" ? payload.error.message : `HTTP ${res.status}`
+      );
+    }
+    throw new Error((await res.text()) || `HTTP ${res.status}`);
+  }
+
+  const blob = await res.blob();
+  const filename = extractFilename(res.headers.get("content-disposition"), fallbackFilename);
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  URL.revokeObjectURL(url);
 }

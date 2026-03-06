@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 from io import StringIO
 import json
 import re
@@ -179,14 +180,90 @@ def _resolve_supplier_id(
     return _get_or_create_supplier(conn, supplier_name)
 
 
+def _find_supplier_id_by_name(conn: sqlite3.Connection, supplier_name: str) -> int | None:
+    normalized = require_non_empty(supplier_name, "supplier")
+    row = conn.execute(
+        "SELECT supplier_id FROM suppliers WHERE name = ?",
+        (normalized,),
+    ).fetchone()
+    if row is not None:
+        return int(row["supplier_id"])
+    casefold_rows = conn.execute(
+        "SELECT supplier_id FROM suppliers WHERE lower(name) = lower(?) ORDER BY supplier_id",
+        (normalized,),
+    ).fetchall()
+    if len(casefold_rows) == 1:
+        return int(casefold_rows[0]["supplier_id"])
+    if len(casefold_rows) > 1:
+        raise AppError(
+            code="AMBIGUOUS_SUPPLIER_NAME",
+            message=(
+                f"Multiple suppliers match '{normalized}' case-insensitively. "
+                "Use supplier_id to disambiguate."
+            ),
+            status_code=409,
+        )
+    return None
+
+
+def _resolve_order_import_supplier_context(
+    conn: sqlite3.Connection,
+    supplier_id: int | None = None,
+    supplier_name: str | None = None,
+) -> dict[str, Any]:
+    if supplier_id is not None:
+        supplier = _get_entity_or_404(
+            conn,
+            "suppliers",
+            "supplier_id",
+            supplier_id,
+            "SUPPLIER_NOT_FOUND",
+            f"Supplier with id {supplier_id} not found",
+        )
+        return {
+            "supplier_id": int(supplier["supplier_id"]),
+            "supplier_name": str(supplier["name"]),
+            "exists": True,
+        }
+    if supplier_name is None:
+        raise AppError(
+            code="INVALID_SUPPLIER",
+            message="supplier_id or supplier_name is required",
+            status_code=422,
+        )
+    normalized_name = require_non_empty(supplier_name, "supplier")
+    resolved_supplier_id = _find_supplier_id_by_name(conn, normalized_name)
+    if resolved_supplier_id is None:
+        return {
+            "supplier_id": None,
+            "supplier_name": normalized_name,
+            "exists": False,
+        }
+    supplier = _get_entity_or_404(
+        conn,
+        "suppliers",
+        "supplier_id",
+        resolved_supplier_id,
+        "SUPPLIER_NOT_FOUND",
+        f"Supplier with id {resolved_supplier_id} not found",
+    )
+    return {
+        "supplier_id": int(supplier["supplier_id"]),
+        "supplier_name": str(supplier["name"]),
+        "exists": True,
+    }
+
+
 def _resolve_order_item(
     conn: sqlite3.Connection,
-    supplier_id: int,
+    supplier_id: int | None,
     ordered_item_number: str,
 ) -> tuple[int | None, int]:
     direct = _resolve_item_by_number(conn, ordered_item_number)
     if direct is not None:
         return direct, 1
+    if supplier_id is None:
+        return None, 1
     alias = conn.execute(
         """
         SELECT canonical_item_id, units_per_order
@@ -257,6 +334,11 @@ def _normalize_item_number_for_lookup(value: str) -> str:
         normalized = normalized.replace(dash, "-")
     normalized = re.sub(r"\s+", "", normalized)
     return normalized
+
+
+ORDER_IMPORT_AUTO_ACCEPT_SCORE = 95
+ORDER_IMPORT_REVIEW_SCORE = 70
+ORDER_IMPORT_PREVIEW_CANDIDATE_LIMIT = 5
 
 
 def _get_inventory_quantity(conn: sqlite3.Connection, item_id: int, location: str) -> int:
@@ -500,6 +582,341 @@ def _load_csv_rows_from_path(path: str | Path) -> list[dict[str, str]]:
     with Path(path).open("r", encoding="utf-8-sig", newline="") as fp:
         reader = csv.DictReader(fp)
         return [{k.strip(): (v.strip() if isinstance(v, str) else v) for k, v in row.items()} for row in reader]
+
+
+IMPORT_TEMPLATE_SPECS: dict[str, dict[str, Any]] = {
+    "items": {
+        "filename": "items_import_template.csv",
+        "fieldnames": [
+            "row_type",
+            "item_number",
+            "manufacturer_name",
+            "category",
+            "url",
+            "description",
+            "supplier",
+            "canonical_item_number",
+            "units_per_order",
+        ],
+    },
+    "inventory": {
+        "filename": "inventory_import_template.csv",
+        "fieldnames": [
+            "operation_type",
+            "item_id",
+            "quantity",
+            "from_location",
+            "to_location",
+            "location",
+            "note",
+        ],
+    },
+    "orders": {
+        "filename": "orders_import_template.csv",
+        "fieldnames": [
+            "item_number",
+            "quantity",
+            "quotation_number",
+            "issue_date",
+            "order_date",
+            "expected_arrival",
+            "pdf_link",
+        ],
+    },
+    "reservations": {
+        "filename": "reservations_import_template.csv",
+        "fieldnames": [
+            "item_id",
+            "assembly",
+            "assembly_quantity",
+            "quantity",
+            "purpose",
+            "deadline",
+            "note",
+            "project_id",
+        ],
+    },
+}
+
+
+def _csv_bytes(fieldnames: list[str], rows: list[dict[str, Any]]) -> bytes:
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(
+            {
+                field: "" if row.get(field) is None else row.get(field)
+                for field in fieldnames
+            }
+        )
+    return output.getvalue().encode("utf-8-sig")
+
+
+def get_import_template_csv(flow_type: str) -> tuple[str, bytes]:
+    spec = IMPORT_TEMPLATE_SPECS.get(flow_type)
+    if spec is None:
+        raise AppError(
+            code="IMPORT_TEMPLATE_NOT_SUPPORTED",
+            message=f"Import template is not defined for flow '{flow_type}'",
+            status_code=404,
+        )
+    return str(spec["filename"]), _csv_bytes(list(spec["fieldnames"]), [])
+
+
+def get_items_import_reference_csv(conn: sqlite3.Connection) -> tuple[str, bytes]:
+    fieldnames = [
+        "reference_type",
+        "item_id",
+        "item_number",
+        "manufacturer_name",
+        "category",
+        "supplier",
+        "ordered_item_number",
+        "units_per_order",
+    ]
+    item_rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            m.name AS manufacturer_name,
+            COALESCE(ca.canonical_category, im.category) AS category
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+        ORDER BY im.item_number, im.item_id
+        """
+    ).fetchall()
+    alias_rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            m.name AS manufacturer_name,
+            COALESCE(ca.canonical_category, im.category) AS category,
+            s.name AS supplier,
+            a.ordered_item_number,
+            a.units_per_order
+        FROM supplier_item_aliases a
+        JOIN suppliers s ON s.supplier_id = a.supplier_id
+        JOIN items_master im ON im.item_id = a.canonical_item_id
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+        ORDER BY s.name, a.ordered_item_number
+        """
+    ).fetchall()
+    rows = [
+        {
+            "reference_type": "item",
+            "item_id": int(row["item_id"]),
+            "item_number": row["item_number"],
+            "manufacturer_name": row["manufacturer_name"],
+            "category": row["category"],
+            "supplier": "",
+            "ordered_item_number": "",
+            "units_per_order": "",
+        }
+        for row in item_rows
+    ]
+    rows.extend(
+        {
+            "reference_type": "supplier_item_alias",
+            "item_id": int(row["item_id"]),
+            "item_number": row["item_number"],
+            "manufacturer_name": row["manufacturer_name"],
+            "category": row["category"],
+            "supplier": row["supplier"],
+            "ordered_item_number": row["ordered_item_number"],
+            "units_per_order": int(row["units_per_order"]),
+        }
+        for row in alias_rows
+    )
+    return "items_import_reference.csv", _csv_bytes(fieldnames, rows)
+
+
+def get_inventory_import_reference_csv(conn: sqlite3.Connection) -> tuple[str, bytes]:
+    fieldnames = [
+        "item_id",
+        "item_number",
+        "manufacturer_name",
+        "category",
+        "location",
+        "current_quantity",
+    ]
+    rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            m.name AS manufacturer_name,
+            COALESCE(ca.canonical_category, im.category) AS category,
+            il.location,
+            COALESCE(il.quantity, 0) AS current_quantity
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+        LEFT JOIN inventory_ledger il ON il.item_id = im.item_id
+        ORDER BY im.item_number, il.location, im.item_id
+        """
+    ).fetchall()
+    return "inventory_import_reference.csv", _csv_bytes(fieldnames, _rows_to_dict(rows))
+
+
+def get_orders_import_reference_csv(
+    conn: sqlite3.Connection,
+    *,
+    supplier_name: str | None = None,
+) -> tuple[str, bytes]:
+    fieldnames = [
+        "reference_type",
+        "supplier_name",
+        "canonical_item_number",
+        "manufacturer_name",
+        "ordered_item_number",
+        "units_per_order",
+    ]
+    normalized_supplier = str(supplier_name or "").strip() or None
+    item_rows = conn.execute(
+        """
+        SELECT im.item_number AS canonical_item_number, m.name AS manufacturer_name
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        ORDER BY im.item_number, im.item_id
+        """
+    ).fetchall()
+    alias_params: tuple[Any, ...]
+    alias_where = ""
+    if normalized_supplier is not None:
+        alias_where = "WHERE s.name = ?"
+        alias_params = (normalized_supplier,)
+    else:
+        alias_params = ()
+    alias_rows = conn.execute(
+        f"""
+        SELECT
+            s.name AS supplier_name,
+            im.item_number AS canonical_item_number,
+            m.name AS manufacturer_name,
+            a.ordered_item_number,
+            a.units_per_order
+        FROM supplier_item_aliases a
+        JOIN suppliers s ON s.supplier_id = a.supplier_id
+        JOIN items_master im ON im.item_id = a.canonical_item_id
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        {alias_where}
+        ORDER BY s.name, a.ordered_item_number
+        """,
+        alias_params,
+    ).fetchall()
+    rows = [
+        {
+            "reference_type": "canonical_item",
+            "supplier_name": normalized_supplier or "",
+            "canonical_item_number": row["canonical_item_number"],
+            "manufacturer_name": row["manufacturer_name"],
+            "ordered_item_number": "",
+            "units_per_order": "",
+        }
+        for row in item_rows
+    ]
+    rows.extend(
+        {
+            "reference_type": "supplier_item_alias",
+            "supplier_name": row["supplier_name"],
+            "canonical_item_number": row["canonical_item_number"],
+            "manufacturer_name": row["manufacturer_name"],
+            "ordered_item_number": row["ordered_item_number"],
+            "units_per_order": int(row["units_per_order"]),
+        }
+        for row in alias_rows
+    )
+    filename = "orders_import_reference.csv"
+    if normalized_supplier is not None:
+        filename = f"orders_import_reference_{_safe_filename_component(normalized_supplier)}.csv"
+    return filename, _csv_bytes(fieldnames, rows)
+
+
+def get_reservations_import_reference_csv(conn: sqlite3.Connection) -> tuple[str, bytes]:
+    fieldnames = [
+        "reference_type",
+        "item_id",
+        "item_number",
+        "manufacturer_name",
+        "assembly_id",
+        "assembly_name",
+        "project_id",
+        "project_name",
+        "project_status",
+    ]
+    item_rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            m.name AS manufacturer_name
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        ORDER BY im.item_number, im.item_id
+        """
+    ).fetchall()
+    assembly_rows = conn.execute(
+        """
+        SELECT assembly_id, name
+        FROM assemblies
+        ORDER BY name, assembly_id
+        """
+    ).fetchall()
+    project_rows = conn.execute(
+        """
+        SELECT project_id, name, status
+        FROM projects
+        ORDER BY name, project_id
+        """
+    ).fetchall()
+    rows = [
+        {
+            "reference_type": "item",
+            "item_id": int(row["item_id"]),
+            "item_number": row["item_number"],
+            "manufacturer_name": row["manufacturer_name"],
+            "assembly_id": "",
+            "assembly_name": "",
+            "project_id": "",
+            "project_name": "",
+            "project_status": "",
+        }
+        for row in item_rows
+    ]
+    rows.extend(
+        {
+            "reference_type": "assembly",
+            "item_id": "",
+            "item_number": "",
+            "manufacturer_name": "",
+            "assembly_id": int(row["assembly_id"]),
+            "assembly_name": row["name"],
+            "project_id": "",
+            "project_name": "",
+            "project_status": "",
+        }
+        for row in assembly_rows
+    )
+    rows.extend(
+        {
+            "reference_type": "project",
+            "item_id": "",
+            "item_number": "",
+            "manufacturer_name": "",
+            "assembly_id": "",
+            "assembly_name": "",
+            "project_id": int(row["project_id"]),
+            "project_name": row["name"],
+            "project_status": row["status"],
+        }
+        for row in project_rows
+    )
+    return "reservations_import_reference.csv", _csv_bytes(fieldnames, rows)
 
 
 def _to_json_text(value: dict[str, Any] | None) -> str | None:
@@ -972,39 +1389,470 @@ def create_item(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[str, 
     return get_item(conn, int(cur.lastrowid))
 
 
+def _normalize_item_import_row_type(row: dict[str, Any]) -> str:
+    row_type_raw = (row.get("row_type") or row.get("resolution_type") or "item").strip().lower()
+    return "item" if row_type_raw in {"", "item", "new_item"} else row_type_raw
+
+
+def _normalize_items_import_overrides(
+    row_overrides: dict[str | int, Any] | None,
+) -> dict[int, dict[str, Any]]:
+    normalized: dict[int, dict[str, Any]] = {}
+    for raw_row_number, raw_override in (row_overrides or {}).items():
+        try:
+            row_number = int(raw_row_number)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_ITEM_IMPORT_OVERRIDE",
+                message=f"Item import override row '{raw_row_number}' is not a valid integer",
+                status_code=422,
+            ) from exc
+        if row_number < 2:
+            raise AppError(
+                code="INVALID_ITEM_IMPORT_OVERRIDE",
+                message=f"Item import override row '{row_number}' must be >= 2",
+                status_code=422,
+            )
+        if not isinstance(raw_override, dict):
+            raise AppError(
+                code="INVALID_ITEM_IMPORT_OVERRIDE",
+                message=f"Item import override for row {row_number} must be an object",
+                status_code=422,
+            )
+        override: dict[str, Any] = {}
+        canonical_item_number = str(raw_override.get("canonical_item_number") or "").strip()
+        if canonical_item_number:
+            override["canonical_item_number"] = canonical_item_number
+        if raw_override.get("units_per_order") not in (None, ""):
+            try:
+                override["units_per_order"] = require_positive_int(
+                    int(raw_override["units_per_order"]),
+                    f"units_per_order override (row {row_number})",
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    code="INVALID_ITEM_IMPORT_OVERRIDE",
+                    message=f"units_per_order override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                ) from exc
+        if override:
+            normalized[row_number] = override
+    return normalized
+
+
+def _get_item_by_number_and_manufacturer(
+    conn: sqlite3.Connection,
+    *,
+    item_number: str,
+    manufacturer_name: str,
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            COALESCE(ca.canonical_category, im.category) AS category,
+            m.name AS manufacturer_name
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+        WHERE im.item_number = ? AND m.name = ?
+        ORDER BY im.item_id
+        """,
+        (item_number, manufacturer_name),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def _load_item_preview_catalog_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number,
+            COALESCE(ca.canonical_category, im.category) AS category,
+            m.name AS manufacturer_name
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+        ORDER BY im.item_number, im.item_id
+        """
+    ).fetchall()
+    return _rows_to_dict(rows)
+
+
+def _build_item_preview_match(
+    item_row: dict[str, Any],
+    *,
+    match_source: str = "item_number",
+    confidence_score: int | None = None,
+    match_reason: str | None = None,
+) -> dict[str, Any]:
+    summary_bits = [str(item_row["manufacturer_name"])]
+    if item_row.get("category"):
+        summary_bits.append(str(item_row["category"]))
+    summary_bits.append(f"#{int(item_row['item_id'])}")
+    return {
+        "entity_type": "item",
+        "entity_id": int(item_row["item_id"]),
+        "value_text": str(item_row["item_number"]),
+        "display_label": f"{item_row['item_number']} ({item_row['manufacturer_name']}) #{int(item_row['item_id'])}",
+        "summary": " | ".join(summary_bits),
+        "match_source": match_source,
+        "confidence_score": confidence_score,
+        "match_reason": match_reason,
+    }
+
+
+def _rank_item_preview_candidates(
+    item_rows: list[dict[str, Any]],
+    raw_value: str,
+    *,
+    limit: int = ORDER_IMPORT_PREVIEW_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for item_row in item_rows:
+        confidence_score, score_reason = _score_order_import_candidate(
+            raw_value,
+            str(item_row["item_number"]),
+        )
+        if confidence_score <= 0:
+            continue
+        ranked.append(
+            _build_item_preview_match(
+                item_row,
+                match_source="item_number",
+                confidence_score=confidence_score,
+                match_reason=f"item_number_{score_reason}",
+            )
+        )
+    ranked.sort(
+        key=lambda entry: (
+            -int(entry.get("confidence_score") or 0),
+            str(entry["value_text"]).casefold(),
+            int(entry["entity_id"]),
+        )
+    )
+    return ranked[:limit]
+
+
+def preview_items_import_from_rows(
+    conn: sqlite3.Connection,
+    *,
+    rows: list[dict[str, str]],
+    source_name: str = "items_import.csv",
+) -> dict[str, Any]:
+    processed_rows = [
+        row
+        for row in rows
+        if any(str(value or "").strip() for value in row.values())
+    ]
+    item_catalog_rows = _load_item_preview_catalog_rows(conn)
+    csv_item_numbers = {
+        (row.get("item_number") or "").strip()
+        for row in processed_rows
+        if _normalize_item_import_row_type(row) == "item"
+        and (row.get("item_number") or "").strip()
+    }
+
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+    blocking_errors: list[str] = []
+
+    for idx, raw_row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in raw_row.values()):
+            continue
+
+        row = dict(raw_row)
+        item_number = str(row.get("item_number") or "").strip()
+        row_type = _normalize_item_import_row_type(row)
+        raw_row_type = str(row.get("row_type") or row.get("resolution_type") or "item").strip().lower()
+        base_preview = {
+            "row": idx,
+            "entry_type": row_type if row_type in {"item", "alias"} else raw_row_type or "item",
+            "item_number": item_number,
+            "manufacturer_name": (
+                str(row.get("manufacturer_name") or row.get("manufacturer") or "UNKNOWN").strip()
+                or "UNKNOWN"
+            ),
+            "supplier": str(row.get("supplier") or "").strip(),
+            "canonical_item_number": str(row.get("canonical_item_number") or "").strip(),
+            "units_per_order": str(row.get("units_per_order") or "").strip() or "1",
+            "category": str(row.get("category") or "").strip(),
+            "url": str(row.get("url") or "").strip(),
+            "description": str(row.get("description") or "").strip(),
+            "allowed_entity_types": [],
+            "requires_user_selection": False,
+            "blocking": False,
+            "suggested_match": None,
+            "candidates": [],
+        }
+
+        if row_type not in {"item", "alias"}:
+            preview_row = {
+                **base_preview,
+                "status": "unresolved",
+                "action": "invalid_row_type",
+                "message": "row_type must be either 'item' or 'alias'",
+                "blocking": True,
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        if row_type == "item":
+            if not item_number:
+                preview_row = {
+                    **base_preview,
+                    "status": "unresolved",
+                    "action": "invalid_item",
+                    "message": "item_number is required",
+                    "blocking": True,
+                }
+            else:
+                existing_item = _get_item_by_number_and_manufacturer(
+                    conn,
+                    item_number=item_number,
+                    manufacturer_name=str(base_preview["manufacturer_name"]),
+                )
+                if existing_item is not None:
+                    preview_row = {
+                        **base_preview,
+                        "status": "needs_review",
+                        "action": "duplicate_item",
+                        "message": "Item already exists; import will record this row as duplicate.",
+                        "suggested_match": _build_item_preview_match(existing_item),
+                    }
+                else:
+                    preview_row = {
+                        **base_preview,
+                        "status": "exact",
+                        "action": "create_item",
+                        "message": "Ready to create item.",
+                    }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary[str(preview_row["status"])] += 1
+            if preview_row["blocking"]:
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        if not item_number:
+            preview_row = {
+                **base_preview,
+                "status": "unresolved",
+                "action": "invalid_alias",
+                "message": "item_number is required for alias rows",
+                "blocking": True,
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        if item_number in csv_item_numbers or _resolve_item_by_number(conn, item_number) is not None:
+            preview_row = {
+                **base_preview,
+                "status": "unresolved",
+                "action": "alias_conflict_direct_item",
+                "message": (
+                    f"ordered_item_number '{item_number}' matches an existing direct item_number; "
+                    "alias would never be used"
+                ),
+                "blocking": True,
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        supplier_name = str(base_preview["supplier"])
+        if not supplier_name:
+            preview_row = {
+                **base_preview,
+                "status": "unresolved",
+                "action": "invalid_alias",
+                "message": "supplier is required for alias rows",
+                "blocking": True,
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        try:
+            units_per_order = require_positive_int(
+                int(str(base_preview["units_per_order"]).strip() or "1"),
+                "units_per_order",
+            )
+        except Exception as exc:  # noqa: BLE001
+            preview_row = {
+                **base_preview,
+                "status": "unresolved",
+                "action": "invalid_alias",
+                "message": "units_per_order must be a positive integer",
+                "blocking": True,
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        canonical_item_number = str(base_preview["canonical_item_number"])
+        candidate_matches = _rank_item_preview_candidates(item_catalog_rows, canonical_item_number)
+        suggested_match = candidate_matches[0] if candidate_matches else None
+        canonical_item_id = _resolve_item_by_number(conn, canonical_item_number) if canonical_item_number else None
+
+        if canonical_item_id is None and canonical_item_number and canonical_item_number in csv_item_numbers:
+            preview_row = {
+                **base_preview,
+                "status": "exact",
+                "action": "create_alias",
+                "message": "Ready to create alias after canonical item rows in this CSV are inserted.",
+            }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary["exact"] += 1
+            continue
+
+        if canonical_item_id is not None:
+            canonical_item_row = next(
+                (item_row for item_row in item_catalog_rows if int(item_row["item_id"]) == canonical_item_id),
+                None,
+            )
+            resolved_match = (
+                _build_item_preview_match(canonical_item_row)
+                if canonical_item_row is not None
+                else None
+            )
+            supplier_id = _find_supplier_id_by_name(conn, supplier_name)
+            existing_alias = (
+                _alias_row_by_supplier_and_ordered(
+                    conn,
+                    supplier_id=supplier_id,
+                    ordered_item_number=item_number,
+                )
+                if supplier_id is not None
+                else None
+            )
+            if existing_alias is None:
+                preview_row = {
+                    **base_preview,
+                    "status": "exact",
+                    "action": "create_alias",
+                    "message": "Ready to create alias mapping.",
+                    "suggested_match": resolved_match,
+                    "units_per_order": str(units_per_order),
+                }
+            elif (
+                str(existing_alias["canonical_item_number"]) == canonical_item_number
+                and int(existing_alias["units_per_order"]) == units_per_order
+            ):
+                preview_row = {
+                    **base_preview,
+                    "status": "exact",
+                    "action": "alias_no_change",
+                    "message": "Alias already matches the current mapping.",
+                    "suggested_match": resolved_match,
+                    "units_per_order": str(units_per_order),
+                }
+            else:
+                preview_row = {
+                    **base_preview,
+                    "status": "needs_review",
+                    "action": "update_alias",
+                    "message": "Alias already exists and will be updated by this import.",
+                    "suggested_match": resolved_match,
+                    "units_per_order": str(units_per_order),
+                }
+            preview_rows.append(preview_row)
+            summary["total_rows"] += 1
+            summary[str(preview_row["status"])] += 1
+            continue
+
+        preview_status = _classify_ranked_preview_status(
+            confidence_score=int(suggested_match["confidence_score"]) if suggested_match else None,
+            match_reason=str(suggested_match["match_reason"]) if suggested_match else None,
+        )
+        preview_row = {
+            **base_preview,
+            "status": preview_status,
+            "action": "resolve_alias_canonical_item",
+            "message": (
+                "Select the canonical item for this alias row."
+                if canonical_item_number
+                else "canonical_item_number is required for alias rows"
+            ),
+            "blocking": True,
+            "requires_user_selection": True,
+            "allowed_entity_types": ["item"],
+            "suggested_match": suggested_match,
+            "candidates": candidate_matches,
+            "units_per_order": str(units_per_order),
+        }
+        preview_rows.append(preview_row)
+        summary["total_rows"] += 1
+        summary[str(preview_status)] += 1
+        blocking_errors.append(f"row {idx}: {preview_row['message']}")
+
+    return {
+        "source_name": source_name,
+        "summary": summary,
+        "blocking_errors": blocking_errors,
+        "can_auto_accept": summary["needs_review"] == 0 and summary["unresolved"] == 0,
+        "rows": preview_rows,
+    }
+
+
 def import_items_from_rows(
     conn: sqlite3.Connection,
     *,
     rows: list[dict[str, str]],
     continue_on_error: bool = True,
     import_job_id: int | None = None,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> dict[str, Any]:
-    def _normalize_row_type(row: dict[str, str]) -> str:
-        row_type_raw = (row.get("row_type") or row.get("resolution_type") or "item").strip().lower()
-        return "item" if row_type_raw in {"", "item", "new_item"} else row_type_raw
-
     processed = 0
     created_count = 0
     duplicate_count = 0
     failed_count = 0
     report: list[dict[str, Any]] = []
     deferred_aliases: list[dict[str, Any]] = []
+    normalized_overrides = _normalize_items_import_overrides(row_overrides)
 
     csv_item_numbers = {
         (row.get("item_number") or "").strip()
         for row in rows
         if any(str(value or "").strip() for value in row.values())
-        and _normalize_row_type(row) == "item"
+        and _normalize_item_import_row_type(row) == "item"
         and (row.get("item_number") or "").strip()
     }
 
-    for idx, row in enumerate(rows, start=2):
-        if not any(str(value or "").strip() for value in row.values()):
+    for idx, raw_row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in raw_row.values()):
             continue
         processed += 1
+        row = dict(raw_row)
+        override = normalized_overrides.get(idx, {})
+        if override.get("canonical_item_number"):
+            row["canonical_item_number"] = str(override["canonical_item_number"])
+        if override.get("units_per_order") is not None:
+            row["units_per_order"] = str(int(override["units_per_order"]))
 
         item_number = (row.get("item_number") or "").strip()
-        row_type = _normalize_row_type(row)
+        row_type = _normalize_item_import_row_type(row)
 
         if row_type not in {"item", "alias"}:
             failed_count += 1
@@ -1304,12 +2152,14 @@ def import_items_from_content(
     *,
     content: bytes,
     continue_on_error: bool = True,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> dict[str, Any]:
     rows = _load_csv_rows_from_content(content)
     return import_items_from_rows(
         conn,
         rows=rows,
         continue_on_error=continue_on_error,
+        row_overrides=row_overrides,
     )
 
 
@@ -1334,6 +2184,7 @@ def import_items_from_content_with_job(
     source_name: str = "items_import.csv",
     continue_on_error: bool = True,
     redo_of_job_id: int | None = None,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> dict[str, Any]:
     source_text = content.decode("utf-8-sig")
     import_job_id = _record_import_job(
@@ -1350,9 +2201,24 @@ def import_items_from_content_with_job(
         rows=rows,
         continue_on_error=continue_on_error,
         import_job_id=import_job_id,
+        row_overrides=row_overrides,
     )
     _finalize_import_job(conn, import_job_id=import_job_id, result=result)
     return {**result, "import_job_id": import_job_id}
+
+
+def preview_items_import_from_content(
+    conn: sqlite3.Connection,
+    *,
+    content: bytes,
+    source_name: str = "items_import.csv",
+) -> dict[str, Any]:
+    rows = _load_csv_rows_from_content(content)
+    return preview_items_import_from_rows(
+        conn,
+        rows=rows,
+        source_name=source_name,
+    )
 
 
 def _get_items_import_job_row(conn: sqlite3.Connection, import_job_id: int) -> sqlite3.Row:
@@ -2254,16 +3120,263 @@ def _parse_csv_int_field(*, value: Any, row_index: int, field_name: str, code: s
         ) from exc
 
 
+def _normalize_inventory_import_overrides(
+    row_overrides: dict[str | int, Any] | None,
+) -> dict[int, dict[str, int]]:
+    normalized: dict[int, dict[str, int]] = {}
+    for raw_row_number, raw_override in (row_overrides or {}).items():
+        try:
+            row_number = int(raw_row_number)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=f"Inventory import override row '{raw_row_number}' is not a valid integer",
+                status_code=422,
+            ) from exc
+        if row_number < 2:
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=f"Inventory import override row '{row_number}' must be >= 2",
+                status_code=422,
+            )
+        if not isinstance(raw_override, dict):
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=f"Inventory import override for row {row_number} must be an object",
+                status_code=422,
+            )
+        if raw_override.get("item_id") in (None, ""):
+            continue
+        try:
+            item_id = int(raw_override["item_id"])
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_INVENTORY_IMPORT_OVERRIDE",
+                message=f"item_id override must be an integer (row {row_number})",
+                status_code=422,
+            ) from exc
+        normalized[row_number] = {"item_id": item_id}
+    return normalized
+
+
+def preview_inventory_movements_from_rows(
+    conn: sqlite3.Connection,
+    *,
+    rows: list[dict[str, Any]],
+    batch_id: str | None = None,
+    source_name: str = "inventory_import.csv",
+) -> dict[str, Any]:
+    item_rows = _load_item_preview_catalog_rows(conn)
+    item_by_id = {int(row["item_id"]): row for row in item_rows}
+    balances: dict[tuple[int, str], int] = {
+        (int(row["item_id"]), str(row["location"])): int(row["quantity"])
+        for row in conn.execute(
+            "SELECT item_id, location, quantity FROM inventory_ledger"
+        ).fetchall()
+    }
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+    blocking_errors: list[str] = []
+
+    for idx, raw_row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in raw_row.values()):
+            continue
+        operation_type_raw = str(raw_row.get("operation_type") or "")
+        item_id_raw = raw_row.get("item_id")
+        quantity_raw = raw_row.get("quantity")
+        from_location = str(raw_row.get("from_location") or "").strip() or None
+        to_location = str(raw_row.get("to_location") or "").strip() or None
+        location = str(raw_row.get("location") or "").strip() or None
+        note = str(raw_row.get("note") or "").strip() or None
+        preview_row = {
+            "row": idx,
+            "operation_type": operation_type_raw,
+            "item_id": str(item_id_raw or "").strip(),
+            "quantity": str(quantity_raw or "").strip(),
+            "from_location": from_location,
+            "to_location": to_location,
+            "location": location,
+            "note": note,
+            "status": "unresolved",
+            "message": "",
+            "blocking": False,
+            "requires_user_selection": False,
+            "allowed_entity_types": [],
+            "suggested_match": None,
+            "candidates": [],
+            "batch_id": batch_id,
+        }
+        summary["total_rows"] += 1
+
+        try:
+            operation_type = _normalize_inventory_csv_operation_type(operation_type_raw)
+            preview_row["operation_type"] = operation_type
+        except AppError as exc:
+            preview_row["message"] = exc.message
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {exc.message}")
+            continue
+
+        try:
+            quantity = require_positive_int(
+                _parse_csv_int_field(
+                    value=quantity_raw,
+                    row_index=idx,
+                    field_name="quantity",
+                    code="INVALID_QUANTITY",
+                ),
+                f"row {idx} quantity",
+            )
+        except AppError as exc:
+            preview_row["message"] = exc.message
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {exc.message}")
+            continue
+
+        resolved_item_id: int | None = None
+        if item_id_raw not in (None, ""):
+            try:
+                resolved_item_id = _parse_csv_int_field(
+                    value=item_id_raw,
+                    row_index=idx,
+                    field_name="item_id",
+                    code="INVALID_ITEM",
+                )
+            except AppError:
+                resolved_item_id = None
+        if resolved_item_id is None or resolved_item_id not in item_by_id:
+            preview_row["message"] = f"row {idx}: choose a valid item for this movement row"
+            preview_row["blocking"] = True
+            preview_row["requires_user_selection"] = True
+            preview_row["allowed_entity_types"] = ["item"]
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        item_row = item_by_id[resolved_item_id]
+        preview_row["suggested_match"] = _build_item_preview_match(item_row)
+        preview_row["item_id"] = str(resolved_item_id)
+        preview_row["quantity"] = str(quantity)
+
+        if operation_type in {"MOVE", "CONSUME", "RESERVE"} and not from_location:
+            preview_row["message"] = f"row {idx}: from_location is required for {operation_type}"
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+        if operation_type in {"MOVE", "ARRIVAL", "RESERVE"} and not to_location:
+            preview_row["message"] = f"row {idx}: to_location is required for {operation_type}"
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+        if operation_type == "ADJUST":
+            location = location or to_location or from_location
+            preview_row["location"] = location
+            if not location:
+                preview_row["message"] = f"row {idx}: location is required for ADJUST"
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["unresolved"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+
+        if operation_type == "MOVE":
+            available = balances.get((resolved_item_id, str(from_location)), 0)
+            if available < quantity:
+                preview_row["status"] = "needs_review"
+                preview_row["message"] = f"Not enough inventory at {from_location}"
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["needs_review"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            balances[(resolved_item_id, str(from_location))] = available - quantity
+            balances[(resolved_item_id, str(to_location))] = balances.get((resolved_item_id, str(to_location)), 0) + quantity
+            preview_row["status"] = "exact"
+            preview_row["message"] = f"Move {quantity} from {from_location} to {to_location}."
+        elif operation_type == "CONSUME":
+            available = balances.get((resolved_item_id, str(from_location)), 0)
+            if available < quantity:
+                preview_row["status"] = "needs_review"
+                preview_row["message"] = f"Not enough inventory at {from_location}"
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["needs_review"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            balances[(resolved_item_id, str(from_location))] = available - quantity
+            preview_row["status"] = "exact"
+            preview_row["message"] = f"Consume {quantity} from {from_location}."
+        elif operation_type == "RESERVE":
+            available = balances.get((resolved_item_id, str(from_location)), 0)
+            if available < quantity:
+                preview_row["status"] = "needs_review"
+                preview_row["message"] = f"Not enough inventory at {from_location}"
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["needs_review"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            balances[(resolved_item_id, str(from_location))] = available - quantity
+            balances[(resolved_item_id, str(to_location))] = balances.get((resolved_item_id, str(to_location)), 0) + quantity
+            preview_row["status"] = "exact"
+            preview_row["message"] = f"Reserve {quantity} from {from_location} to {to_location}."
+        elif operation_type == "ADJUST":
+            balances[(resolved_item_id, str(location))] = balances.get((resolved_item_id, str(location)), 0) + quantity
+            preview_row["status"] = "exact"
+            preview_row["message"] = f"Adjust +{quantity} at {location}."
+        elif operation_type == "ARRIVAL":
+            balances[(resolved_item_id, str(to_location))] = balances.get((resolved_item_id, str(to_location)), 0) + quantity
+            preview_row["status"] = "exact"
+            preview_row["message"] = f"Arrival +{quantity} to {to_location}."
+        else:
+            preview_row["message"] = f"Unsupported batch operation_type: {operation_type}"
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        preview_rows.append(preview_row)
+        summary["exact"] += 1
+
+    return {
+        "source_name": source_name,
+        "summary": summary,
+        "blocking_errors": blocking_errors,
+        "can_auto_accept": summary["needs_review"] == 0 and summary["unresolved"] == 0,
+        "rows": preview_rows,
+    }
+
+
 def import_inventory_movements_from_rows(
     conn: sqlite3.Connection,
     *,
     rows: list[dict[str, Any]],
     batch_id: str | None = None,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> dict[str, Any]:
     operations: list[dict[str, Any]] = []
-    for idx, row in enumerate(rows, start=2):
+    normalized_overrides = _normalize_inventory_import_overrides(row_overrides)
+    for idx, raw_row in enumerate(rows, start=2):
+        row = dict(raw_row)
+        override = normalized_overrides.get(idx, {})
         op_type = _normalize_inventory_csv_operation_type(row.get("operation_type", ""))
-        item_id_raw = row.get("item_id")
+        item_id_raw = override.get("item_id", row.get("item_id"))
         if item_id_raw in (None, ""):
             raise AppError(code="INVALID_ITEM", message=f"row {idx}: item_id is required", status_code=422)
         quantity_raw = row.get("quantity")
@@ -2301,9 +3414,31 @@ def import_inventory_movements_from_content(
     *,
     content: bytes,
     batch_id: str | None = None,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> dict[str, Any]:
     rows = _load_csv_rows_from_content(content)
-    return import_inventory_movements_from_rows(conn, rows=rows, batch_id=batch_id)
+    return import_inventory_movements_from_rows(
+        conn,
+        rows=rows,
+        batch_id=batch_id,
+        row_overrides=row_overrides,
+    )
+
+
+def preview_inventory_movements_from_content(
+    conn: sqlite3.Connection,
+    *,
+    content: bytes,
+    batch_id: str | None = None,
+    source_name: str = "inventory_import.csv",
+) -> dict[str, Any]:
+    rows = _load_csv_rows_from_content(content)
+    return preview_inventory_movements_from_rows(
+        conn,
+        rows=rows,
+        batch_id=batch_id,
+        source_name=source_name,
+    )
 
 
 def _assembly_lookup_map(conn: sqlite3.Connection) -> dict[str, int]:
@@ -2315,14 +3450,388 @@ def _assembly_lookup_map(conn: sqlite3.Connection) -> dict[str, int]:
     return result
 
 
+def _load_assembly_preview_catalog_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            a.assembly_id,
+            a.name,
+            a.description,
+            COUNT(ac.item_id) AS component_count
+        FROM assemblies a
+        LEFT JOIN assembly_components ac ON ac.assembly_id = a.assembly_id
+        GROUP BY a.assembly_id
+        ORDER BY a.name, a.assembly_id
+        """
+    ).fetchall()
+    return _rows_to_dict(rows)
+
+
+def _build_assembly_preview_match(
+    assembly_row: dict[str, Any],
+    *,
+    match_source: str = "name",
+    confidence_score: int | None = None,
+    match_reason: str | None = None,
+) -> dict[str, Any]:
+    summary = f"{int(assembly_row.get('component_count') or 0)} component(s) | #{int(assembly_row['assembly_id'])}"
+    if assembly_row.get("description"):
+        summary = f"{summary} | {assembly_row['description']}"
+    return {
+        "entity_type": "assembly",
+        "entity_id": int(assembly_row["assembly_id"]),
+        "value_text": str(assembly_row["name"]),
+        "display_label": f"{assembly_row['name']} #{int(assembly_row['assembly_id'])}",
+        "summary": summary,
+        "match_source": match_source,
+        "confidence_score": confidence_score,
+        "match_reason": match_reason,
+    }
+
+
+def _rank_assembly_preview_candidates(
+    assembly_rows: list[dict[str, Any]],
+    raw_value: str,
+    *,
+    limit: int = ORDER_IMPORT_PREVIEW_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for assembly_row in assembly_rows:
+        confidence_score, score_reason = _score_order_import_candidate(
+            raw_value,
+            str(assembly_row["name"]),
+        )
+        if confidence_score <= 0:
+            continue
+        ranked.append(
+            _build_assembly_preview_match(
+                assembly_row,
+                confidence_score=confidence_score,
+                match_reason=f"assembly_name_{score_reason}",
+            )
+        )
+    ranked.sort(
+        key=lambda entry: (
+            -int(entry.get("confidence_score") or 0),
+            str(entry["value_text"]).casefold(),
+            int(entry["entity_id"]),
+        )
+    )
+    return ranked[:limit]
+
+
+def _normalize_reservations_import_overrides(
+    row_overrides: dict[str | int, Any] | None,
+) -> dict[int, dict[str, int]]:
+    normalized: dict[int, dict[str, int]] = {}
+    for raw_row_number, raw_override in (row_overrides or {}).items():
+        try:
+            row_number = int(raw_row_number)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=f"Reservation import override row '{raw_row_number}' is not a valid integer",
+                status_code=422,
+            ) from exc
+        if row_number < 2:
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=f"Reservation import override row '{row_number}' must be >= 2",
+                status_code=422,
+            )
+        if not isinstance(raw_override, dict):
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=f"Reservation import override for row {row_number} must be an object",
+                status_code=422,
+            )
+        override: dict[str, int] = {}
+        if raw_override.get("item_id") not in (None, ""):
+            try:
+                override["item_id"] = int(raw_override["item_id"])
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                    message=f"item_id override must be an integer (row {row_number})",
+                    status_code=422,
+                ) from exc
+        if raw_override.get("assembly_id") not in (None, ""):
+            try:
+                override["assembly_id"] = int(raw_override["assembly_id"])
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                    message=f"assembly_id override must be an integer (row {row_number})",
+                    status_code=422,
+                ) from exc
+        if "item_id" in override and "assembly_id" in override:
+            raise AppError(
+                code="INVALID_RESERVATION_IMPORT_OVERRIDE",
+                message=f"Reservation import override row {row_number} must choose item_id or assembly_id, not both",
+                status_code=422,
+            )
+        if override:
+            normalized[row_number] = override
+    return normalized
+
+
+def preview_reservations_from_rows(
+    conn: sqlite3.Connection,
+    *,
+    rows: list[dict[str, Any]],
+    source_name: str = "reservations_import.csv",
+) -> dict[str, Any]:
+    item_rows = _load_item_preview_catalog_rows(conn)
+    item_by_id = {int(row["item_id"]): row for row in item_rows}
+    assembly_rows = _load_assembly_preview_catalog_rows(conn)
+    assembly_by_id = {int(row["assembly_id"]): row for row in assembly_rows}
+    assembly_map = _assembly_lookup_map(conn)
+    available_by_item = {
+        int(row["item_id"]): _get_total_available_inventory(conn, int(row["item_id"]))
+        for row in item_rows
+    }
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+    blocking_errors: list[str] = []
+
+    for idx, raw_row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in raw_row.values()):
+            continue
+        qty_raw = raw_row.get("quantity")
+        purpose = str(raw_row.get("purpose") or "").strip() or None
+        note = str(raw_row.get("note") or "").strip() or None
+        assembly_ref = str(raw_row.get("assembly") or raw_row.get("assembly_name") or "").strip()
+        assembly_qty_raw = raw_row.get("assembly_quantity")
+        item_id_raw = raw_row.get("item_id")
+        preview_row = {
+            "row": idx,
+            "quantity": str(qty_raw or "").strip(),
+            "item_id": str(item_id_raw or "").strip(),
+            "assembly": assembly_ref,
+            "assembly_quantity": str(assembly_qty_raw or "").strip() or "1",
+            "purpose": purpose,
+            "deadline": str(raw_row.get("deadline") or "").strip() or None,
+            "note": note,
+            "project_id": str(raw_row.get("project_id") or "").strip() or None,
+            "status": "unresolved",
+            "message": "",
+            "blocking": False,
+            "requires_user_selection": False,
+            "allowed_entity_types": [],
+            "suggested_match": None,
+            "candidates": [],
+            "generated_reservations": [],
+        }
+        summary["total_rows"] += 1
+
+        try:
+            quantity = require_positive_int(
+                _parse_csv_int_field(
+                    value=qty_raw,
+                    row_index=idx,
+                    field_name="quantity",
+                    code="INVALID_QUANTITY",
+                ),
+                f"row {idx} quantity",
+            )
+        except AppError as exc:
+            preview_row["message"] = exc.message
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {exc.message}")
+            continue
+
+        try:
+            deadline = normalize_optional_date((raw_row.get("deadline") or None), "deadline")
+            preview_row["deadline"] = deadline
+        except AppError as exc:
+            preview_row["message"] = exc.message
+            preview_row["blocking"] = True
+            preview_rows.append(preview_row)
+            summary["unresolved"] += 1
+            blocking_errors.append(f"row {idx}: {exc.message}")
+            continue
+
+        project_id: int | None = None
+        project_id_raw = raw_row.get("project_id")
+        if project_id_raw not in (None, ""):
+            try:
+                project_id = _parse_csv_int_field(
+                    value=project_id_raw,
+                    row_index=idx,
+                    field_name="project_id",
+                    code="INVALID_PROJECT",
+                )
+                _get_entity_or_404(
+                    conn,
+                    "projects",
+                    "project_id",
+                    project_id,
+                    "PROJECT_NOT_FOUND",
+                    f"Project with id {project_id} not found",
+                )
+            except AppError as exc:
+                preview_row["message"] = exc.message
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["unresolved"] += 1
+                blocking_errors.append(f"row {idx}: {exc.message}")
+                continue
+
+        assembly_quantity = 1
+        if assembly_qty_raw not in (None, ""):
+            try:
+                assembly_quantity = require_positive_int(
+                    _parse_csv_int_field(
+                        value=assembly_qty_raw,
+                        row_index=idx,
+                        field_name="assembly_quantity",
+                        code="INVALID_QUANTITY",
+                    ),
+                    f"row {idx} assembly_quantity",
+                )
+            except AppError as exc:
+                preview_row["message"] = exc.message
+                preview_row["blocking"] = True
+                preview_rows.append(preview_row)
+                summary["unresolved"] += 1
+                blocking_errors.append(f"row {idx}: {exc.message}")
+                continue
+
+        generated_rows: list[dict[str, Any]] = []
+        if item_id_raw not in (None, ""):
+            try:
+                item_id = _parse_csv_int_field(
+                    value=item_id_raw,
+                    row_index=idx,
+                    field_name="item_id",
+                    code="INVALID_ITEM",
+                )
+            except AppError:
+                item_id = None
+            if item_id is None or item_id not in item_by_id:
+                preview_row["message"] = f"row {idx}: choose a valid item or assembly for this reservation row"
+                preview_row["blocking"] = True
+                preview_row["requires_user_selection"] = True
+                preview_row["allowed_entity_types"] = ["item", "assembly"]
+                preview_rows.append(preview_row)
+                summary["unresolved"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            item_row = item_by_id[item_id]
+            preview_row["suggested_match"] = _build_item_preview_match(item_row)
+            generated_rows.append(
+                {
+                    "item_id": item_id,
+                    "item_number": item_row["item_number"],
+                    "manufacturer_name": item_row["manufacturer_name"],
+                    "quantity": quantity,
+                }
+            )
+        else:
+            if not assembly_ref:
+                preview_row["message"] = f"row {idx}: either item_id or assembly is required"
+                preview_row["blocking"] = True
+                preview_row["requires_user_selection"] = True
+                preview_row["allowed_entity_types"] = ["item", "assembly"]
+                preview_rows.append(preview_row)
+                summary["unresolved"] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            assembly_id = assembly_map.get(assembly_ref.casefold())
+            if assembly_id is None:
+                candidate_matches = _rank_assembly_preview_candidates(assembly_rows, assembly_ref)
+                suggested_match = candidate_matches[0] if candidate_matches else None
+                preview_status = _classify_ranked_preview_status(
+                    confidence_score=int(suggested_match["confidence_score"]) if suggested_match else None,
+                    match_reason=str(suggested_match["match_reason"]) if suggested_match else None,
+                )
+                preview_row["status"] = preview_status
+                preview_row["message"] = f"row {idx}: choose a valid item or assembly for this reservation row"
+                preview_row["blocking"] = True
+                preview_row["requires_user_selection"] = True
+                preview_row["allowed_entity_types"] = ["item", "assembly"]
+                preview_row["suggested_match"] = suggested_match
+                preview_row["candidates"] = candidate_matches
+                preview_rows.append(preview_row)
+                summary[str(preview_status)] += 1
+                blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                continue
+            assembly = get_assembly(conn, assembly_id)
+            preview_row["suggested_match"] = _build_assembly_preview_match(assembly_by_id[assembly_id])
+            for component in assembly.get("components", []):
+                item_id = int(component["item_id"])
+                item_row = item_by_id.get(item_id)
+                if item_row is None:
+                    preview_row["message"] = f"row {idx}: assembly component item {item_id} not found"
+                    preview_row["blocking"] = True
+                    preview_rows.append(preview_row)
+                    summary["unresolved"] += 1
+                    blocking_errors.append(f"row {idx}: {preview_row['message']}")
+                    break
+                generated_rows.append(
+                    {
+                        "item_id": item_id,
+                        "item_number": item_row["item_number"],
+                        "manufacturer_name": item_row["manufacturer_name"],
+                        "quantity": int(component["quantity"]) * quantity * assembly_quantity,
+                    }
+                )
+            if preview_row["blocking"]:
+                continue
+
+        shortages = [
+            generated
+            for generated in generated_rows
+            if available_by_item.get(int(generated["item_id"]), 0) < int(generated["quantity"])
+        ]
+        if shortages:
+            preview_row["status"] = "needs_review"
+            preview_row["message"] = "Not enough available inventory for reservation."
+            preview_row["blocking"] = True
+            preview_row["generated_reservations"] = generated_rows
+            preview_rows.append(preview_row)
+            summary["needs_review"] += 1
+            blocking_errors.append(f"row {idx}: {preview_row['message']}")
+            continue
+
+        for generated in generated_rows:
+            available_by_item[int(generated["item_id"])] = available_by_item.get(int(generated["item_id"]), 0) - int(
+                generated["quantity"]
+            )
+        preview_row["status"] = "exact"
+        preview_row["message"] = "Ready to create reservation row."
+        preview_row["generated_reservations"] = generated_rows
+        preview_rows.append(preview_row)
+        summary["exact"] += 1
+
+    return {
+        "source_name": source_name,
+        "summary": summary,
+        "blocking_errors": blocking_errors,
+        "can_auto_accept": summary["needs_review"] == 0 and summary["unresolved"] == 0,
+        "rows": preview_rows,
+    }
+
+
 def import_reservations_from_rows(
     conn: sqlite3.Connection,
     *,
     rows: list[dict[str, Any]],
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> list[dict[str, Any]]:
     created: list[dict[str, Any]] = []
     assembly_map = _assembly_lookup_map(conn)
-    for idx, row in enumerate(rows, start=2):
+    normalized_overrides = _normalize_reservations_import_overrides(row_overrides)
+    for idx, raw_row in enumerate(rows, start=2):
+        row = dict(raw_row)
         qty_raw = row.get("quantity")
         if qty_raw in (None, ""):
             raise AppError(code="INVALID_QUANTITY", message=f"row {idx}: quantity is required", status_code=422)
@@ -2340,8 +3849,16 @@ def import_reservations_from_rows(
             else None
         )
 
-        item_id_raw = row.get("item_id")
-        assembly_ref = str(row.get("assembly") or row.get("assembly_name") or "").strip()
+        override = normalized_overrides.get(idx, {})
+        item_id_override = override.get("item_id")
+        assembly_id_override = override.get("assembly_id")
+
+        item_id_raw = item_id_override if item_id_override is not None else row.get("item_id")
+        assembly_ref = (
+            ""
+            if item_id_override is not None
+            else str(row.get("assembly") or row.get("assembly_name") or "").strip()
+        )
         assembly_qty_raw = row.get("assembly_quantity")
 
         if item_id_raw not in (None, ""):
@@ -2360,9 +3877,14 @@ def import_reservations_from_rows(
             )
             continue
 
+        if assembly_id_override is not None:
+            assembly_id = int(assembly_id_override)
+        else:
+            if not assembly_ref:
+                raise AppError(code="INVALID_ITEM", message=f"row {idx}: either item_id or assembly is required", status_code=422)
+            assembly_id = assembly_map.get(assembly_ref.casefold())
         if not assembly_ref:
-            raise AppError(code="INVALID_ITEM", message=f"row {idx}: either item_id or assembly is required", status_code=422)
-        assembly_id = assembly_map.get(assembly_ref.casefold())
+            assembly_ref = str(assembly_id)
         if assembly_id is None:
             raise AppError(code="ASSEMBLY_NOT_FOUND", message=f"row {idx}: assembly '{assembly_ref}' not found", status_code=404)
         assembly_quantity = (
@@ -2400,9 +3922,24 @@ def import_reservations_from_content(
     conn: sqlite3.Connection,
     *,
     content: bytes,
+    row_overrides: dict[str | int, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rows = _load_csv_rows_from_content(content)
-    return import_reservations_from_rows(conn, rows=rows)
+    return import_reservations_from_rows(conn, rows=rows, row_overrides=row_overrides)
+
+
+def preview_reservations_from_content(
+    conn: sqlite3.Connection,
+    *,
+    content: bytes,
+    source_name: str = "reservations_import.csv",
+) -> dict[str, Any]:
+    rows = _load_csv_rows_from_content(content)
+    return preview_reservations_from_rows(
+        conn,
+        rows=rows,
+        source_name=source_name,
+    )
 def list_orders(
     conn: sqlite3.Connection,
     *,
@@ -3144,6 +4681,691 @@ def _merge_order_csv_rows(
     return {"updated": False, "file": None}
 
 
+def _order_import_duplicate_quotation_numbers(
+    conn: sqlite3.Connection,
+    supplier_id: int,
+    quotation_numbers: list[str],
+) -> list[str]:
+    normalized_numbers = sorted(
+        {
+            str(quotation_number).strip()
+            for quotation_number in quotation_numbers
+            if str(quotation_number).strip()
+        }
+    )
+    if not normalized_numbers:
+        return []
+    placeholders = ",".join("?" for _ in normalized_numbers)
+    duplicate_rows = conn.execute(
+        f"""
+        SELECT q.quotation_number
+        FROM quotations q
+        WHERE q.supplier_id = ?
+          AND q.quotation_number IN ({placeholders})
+          AND EXISTS (
+            SELECT 1
+            FROM orders o
+            WHERE o.quotation_id = q.quotation_id
+          )
+        ORDER BY q.quotation_number
+        """,
+        (supplier_id, *normalized_numbers),
+    ).fetchall()
+    return [str(row["quotation_number"]) for row in duplicate_rows]
+
+
+def _normalize_order_import_overrides(
+    row_overrides: dict[str | int, Any] | None,
+) -> dict[int, dict[str, int]]:
+    normalized: dict[int, dict[str, int]] = {}
+    for raw_row_number, raw_override in (row_overrides or {}).items():
+        try:
+            row_number = int(raw_row_number)
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_OVERRIDE",
+                message=f"Order import override row '{raw_row_number}' is not a valid integer",
+                status_code=422,
+            ) from exc
+        if row_number < 2:
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_OVERRIDE",
+                message=f"Order import override row '{row_number}' must be >= 2",
+                status_code=422,
+            )
+        if not isinstance(raw_override, dict):
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_OVERRIDE",
+                message=f"Order import override for row {row_number} must be an object",
+                status_code=422,
+            )
+        override: dict[str, int] = {}
+        if raw_override.get("item_id") not in (None, ""):
+            try:
+                override["item_id"] = int(raw_override["item_id"])
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    code="INVALID_ORDER_IMPORT_OVERRIDE",
+                    message=f"item_id override must be an integer (row {row_number})",
+                    status_code=422,
+                ) from exc
+        if raw_override.get("units_per_order") not in (None, ""):
+            try:
+                override["units_per_order"] = require_positive_int(
+                    int(raw_override["units_per_order"]),
+                    f"units_per_order override (row {row_number})",
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise AppError(
+                    code="INVALID_ORDER_IMPORT_OVERRIDE",
+                    message=f"units_per_order override must be an integer > 0 (row {row_number})",
+                    status_code=422,
+                ) from exc
+        if override:
+            normalized[row_number] = override
+    return normalized
+
+
+def _normalize_order_import_alias_saves(
+    alias_saves: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for idx, raw_alias in enumerate(alias_saves or [], start=1):
+        if not isinstance(raw_alias, dict):
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_ALIAS",
+                message=f"Alias save entry #{idx} must be an object",
+                status_code=422,
+            )
+        ordered_item_number = require_non_empty(
+            str(raw_alias.get("ordered_item_number", "")),
+            f"ordered_item_number (alias save #{idx})",
+        )
+        if raw_alias.get("item_id") in (None, ""):
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_ALIAS",
+                message=f"Alias save entry #{idx} requires item_id",
+                status_code=422,
+            )
+        try:
+            item_id = int(raw_alias["item_id"])
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_ALIAS",
+                message=f"Alias save item_id must be an integer (entry #{idx})",
+                status_code=422,
+            ) from exc
+        units_raw = raw_alias.get("units_per_order", 1)
+        try:
+            units_per_order = require_positive_int(
+                int(units_raw),
+                f"units_per_order (alias save #{idx})",
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_ORDER_IMPORT_ALIAS",
+                message=f"Alias save units_per_order must be an integer > 0 (entry #{idx})",
+                status_code=422,
+            ) from exc
+        normalized.append(
+            {
+                "ordered_item_number": ordered_item_number,
+                "item_id": item_id,
+                "units_per_order": units_per_order,
+            }
+        )
+    return normalized
+
+
+def _apply_order_import_alias_saves(
+    conn: sqlite3.Connection,
+    *,
+    supplier_id: int,
+    alias_saves: list[dict[str, Any]],
+) -> int:
+    deduped: dict[str, dict[str, Any]] = {}
+    for alias in alias_saves:
+        deduped[str(alias["ordered_item_number"]).casefold()] = alias
+
+    saved_count = 0
+    for alias in deduped.values():
+        ordered_item_number = str(alias["ordered_item_number"])
+        if _resolve_item_by_number(conn, ordered_item_number) is not None:
+            continue
+        upsert_supplier_item_alias(
+            conn,
+            supplier_id=supplier_id,
+            ordered_item_number=ordered_item_number,
+            canonical_item_id=int(alias["item_id"]),
+            units_per_order=int(alias["units_per_order"]),
+        )
+        saved_count += 1
+    return saved_count
+
+
+def _load_order_import_preview_candidates(
+    conn: sqlite3.Connection,
+    supplier_id: int | None,
+) -> list[dict[str, Any]]:
+    direct_rows = conn.execute(
+        """
+        SELECT
+            im.item_id,
+            im.item_number AS canonical_item_number,
+            m.name AS manufacturer_name
+        FROM items_master im
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        ORDER BY im.item_number, im.item_id
+        """
+    ).fetchall()
+    candidates: list[dict[str, Any]] = [
+        {
+            "item_id": int(row["item_id"]),
+            "canonical_item_number": str(row["canonical_item_number"]),
+            "manufacturer_name": str(row["manufacturer_name"]),
+            "units_per_order": 1,
+            "candidate_text": str(row["canonical_item_number"]),
+            "match_source": "item_number",
+            "summary": f"{row['manufacturer_name']} | direct item number",
+        }
+        for row in direct_rows
+    ]
+    if supplier_id is None:
+        return candidates
+
+    alias_rows = conn.execute(
+        """
+        SELECT
+            a.ordered_item_number,
+            a.units_per_order,
+            im.item_id,
+            im.item_number AS canonical_item_number,
+            m.name AS manufacturer_name
+        FROM supplier_item_aliases a
+        JOIN items_master im ON im.item_id = a.canonical_item_id
+        JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+        WHERE a.supplier_id = ?
+        ORDER BY a.ordered_item_number, a.alias_id
+        """,
+        (supplier_id,),
+    ).fetchall()
+    candidates.extend(
+        {
+            "item_id": int(row["item_id"]),
+            "canonical_item_number": str(row["canonical_item_number"]),
+            "manufacturer_name": str(row["manufacturer_name"]),
+            "units_per_order": int(row["units_per_order"]),
+            "candidate_text": str(row["ordered_item_number"]),
+            "match_source": "supplier_item_alias",
+            "summary": (
+                f"{row['manufacturer_name']} | alias {row['ordered_item_number']} | "
+                f"units/order {int(row['units_per_order'])}"
+            ),
+        }
+        for row in alias_rows
+    )
+    return candidates
+
+
+def _load_supplier_preview_catalog_rows(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT supplier_id, name
+        FROM suppliers
+        ORDER BY name, supplier_id
+        """
+    ).fetchall()
+    return _rows_to_dict(rows)
+
+
+def _build_supplier_preview_match(
+    supplier_row: dict[str, Any],
+    *,
+    confidence_score: int | None = None,
+    match_reason: str | None = None,
+) -> dict[str, Any]:
+    supplier_id = int(supplier_row["supplier_id"])
+    supplier_name = str(supplier_row["name"])
+    return {
+        "entity_type": "supplier",
+        "entity_id": supplier_id,
+        "value_text": supplier_name,
+        "display_label": supplier_name,
+        "summary": f"Supplier #{supplier_id}",
+        "match_source": "name",
+        "confidence_score": confidence_score,
+        "match_reason": match_reason,
+    }
+
+
+def _rank_supplier_preview_candidates(
+    supplier_rows: list[dict[str, Any]],
+    raw_value: str,
+    *,
+    limit: int = ORDER_IMPORT_PREVIEW_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    ranked: list[dict[str, Any]] = []
+    for supplier_row in supplier_rows:
+        confidence_score, score_reason = _score_order_import_candidate(
+            raw_value,
+            str(supplier_row["name"]),
+        )
+        if confidence_score <= 0:
+            continue
+        ranked.append(
+            _build_supplier_preview_match(
+                supplier_row,
+                confidence_score=confidence_score,
+                match_reason=f"name_{score_reason}",
+            )
+        )
+    ranked.sort(
+        key=lambda entry: (
+            -int(entry.get("confidence_score") or 0),
+            str(entry["value_text"]).casefold(),
+            int(entry["entity_id"]),
+        )
+    )
+    return ranked[:limit]
+
+
+def _rank_order_style_preview_candidates(
+    raw_value: str,
+    preview_candidates: list[dict[str, Any]],
+    *,
+    limit: int = ORDER_IMPORT_PREVIEW_CANDIDATE_LIMIT,
+) -> list[dict[str, Any]]:
+    ranked_candidates: list[dict[str, Any]] = []
+    for candidate in preview_candidates:
+        confidence_score, score_reason = _score_order_import_candidate(
+            raw_value,
+            str(candidate["candidate_text"]),
+        )
+        if confidence_score <= 0:
+            continue
+        ranked_candidates.append(
+            {
+                "item_id": int(candidate["item_id"]),
+                "canonical_item_number": str(candidate["canonical_item_number"]),
+                "manufacturer_name": str(candidate["manufacturer_name"]),
+                "units_per_order": int(candidate["units_per_order"]),
+                "display_label": (
+                    f"{candidate['canonical_item_number']} "
+                    f"({candidate['manufacturer_name']}) #{int(candidate['item_id'])}"
+                ),
+                "summary": str(candidate["summary"]),
+                "match_source": str(candidate["match_source"]),
+                "match_reason": f"{candidate['match_source']}_{score_reason}",
+                "confidence_score": confidence_score,
+            }
+        )
+
+    deduped_candidates: dict[tuple[int, int], dict[str, Any]] = {}
+    for candidate in sorted(
+        ranked_candidates,
+        key=lambda entry: (
+            -int(entry["confidence_score"]),
+            0 if entry["match_source"] == "supplier_item_alias" else 1,
+            str(entry["canonical_item_number"]).casefold(),
+            int(entry["item_id"]),
+        ),
+    ):
+        dedupe_key = (int(candidate["item_id"]), int(candidate["units_per_order"]))
+        if dedupe_key not in deduped_candidates:
+            deduped_candidates[dedupe_key] = candidate
+    return list(deduped_candidates.values())[:limit]
+
+
+def _build_bom_item_preview_match(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "entity_type": "item",
+        "entity_id": int(candidate["item_id"]),
+        "value_text": str(candidate["canonical_item_number"]),
+        "display_label": str(candidate["display_label"]),
+        "summary": str(candidate["summary"]),
+        "match_source": str(candidate["match_source"]),
+        "confidence_score": int(candidate["confidence_score"]),
+        "match_reason": str(candidate["match_reason"]),
+        "canonical_item_number": str(candidate["canonical_item_number"]),
+        "manufacturer_name": str(candidate["manufacturer_name"]),
+        "units_per_order": int(candidate["units_per_order"]),
+    }
+
+
+def _resolve_bom_preview_supplier(
+    supplier_rows: list[dict[str, Any]],
+    raw_supplier: str,
+) -> dict[str, Any]:
+    supplier_name = str(raw_supplier or "").strip()
+    if not supplier_name:
+        return {
+            "status": "unresolved",
+            "message": "supplier is required",
+            "requires_selection": True,
+            "suggested_match": None,
+            "candidates": [],
+            "preview_supplier_id": None,
+        }
+
+    candidate_matches = _rank_supplier_preview_candidates(supplier_rows, supplier_name)
+    exact_candidates = _exact_preview_candidates(candidate_matches)
+    if len(exact_candidates) == 1:
+        return {
+            "status": "exact",
+            "message": "Matched registered supplier.",
+            "requires_selection": False,
+            "suggested_match": exact_candidates[0],
+            "candidates": candidate_matches,
+            "preview_supplier_id": int(exact_candidates[0]["entity_id"]),
+        }
+    if len(exact_candidates) > 1:
+        return {
+            "status": "needs_review",
+            "message": "Multiple registered suppliers match this name. Choose the correct supplier.",
+            "requires_selection": True,
+            "suggested_match": None,
+            "candidates": exact_candidates,
+            "preview_supplier_id": None,
+        }
+
+    best_candidate = candidate_matches[0] if candidate_matches else None
+    status = _classify_ranked_preview_status(
+        confidence_score=int(best_candidate["confidence_score"]) if best_candidate else None,
+        match_reason=str(best_candidate["match_reason"]) if best_candidate else None,
+    )
+    if status == "high_confidence":
+        message = "High-confidence supplier match found."
+    elif status == "needs_review":
+        message = "Review the suggested supplier before continuing."
+    else:
+        message = "No registered supplier matched this row."
+    return {
+        "status": status,
+        "message": message,
+        "requires_selection": status in {"needs_review", "unresolved"},
+        "suggested_match": best_candidate if status != "unresolved" else None,
+        "candidates": candidate_matches,
+        "preview_supplier_id": (
+            int(best_candidate["entity_id"])
+            if best_candidate is not None and status != "unresolved"
+            else None
+        ),
+    }
+
+
+def _resolve_bom_preview_item(
+    raw_item_number: str,
+    preview_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    item_number = str(raw_item_number or "").strip()
+    if not item_number:
+        return {
+            "status": "unresolved",
+            "message": "item_number is required",
+            "requires_selection": True,
+            "suggested_match": None,
+            "candidates": [],
+        }
+
+    candidate_matches = [
+        _build_bom_item_preview_match(candidate)
+        for candidate in _rank_order_style_preview_candidates(item_number, preview_candidates)
+    ]
+    exact_candidates = _exact_preview_candidates(candidate_matches)
+    if len(exact_candidates) == 1:
+        exact_match = exact_candidates[0]
+        return {
+            "status": "exact",
+            "message": (
+                "Matched supplier alias to a canonical item."
+                if str(exact_match.get("match_source") or "") == "supplier_item_alias"
+                else "Matched registered item."
+            ),
+            "requires_selection": False,
+            "suggested_match": exact_match,
+            "candidates": candidate_matches,
+        }
+    if len(exact_candidates) > 1:
+        return {
+            "status": "needs_review",
+            "message": "Multiple registered items match this row. Choose the correct item.",
+            "requires_selection": True,
+            "suggested_match": None,
+            "candidates": exact_candidates,
+        }
+
+    best_candidate = candidate_matches[0] if candidate_matches else None
+    status = _classify_ranked_preview_status(
+        confidence_score=int(best_candidate["confidence_score"]) if best_candidate else None,
+        match_reason=str(best_candidate["match_reason"]) if best_candidate else None,
+    )
+    if status == "high_confidence":
+        message = "High-confidence item match found."
+    elif status == "needs_review":
+        message = "Review the suggested item before continuing."
+    else:
+        message = "No reliable registered item matched this row."
+    return {
+        "status": status,
+        "message": message,
+        "requires_selection": status in {"needs_review", "unresolved"},
+        "suggested_match": best_candidate if status != "unresolved" else None,
+        "candidates": candidate_matches,
+    }
+
+
+def _score_order_import_candidate(raw_value: str, candidate_text: str) -> tuple[int, str]:
+    raw_text = str(raw_value or "").strip()
+    match_text = str(candidate_text or "").strip()
+    if not raw_text or not match_text:
+        return 0, "none"
+    if raw_text == match_text:
+        return 100, "exact"
+    if raw_text.casefold() == match_text.casefold():
+        return 99, "casefold_exact"
+    normalized_raw = _normalize_item_number_for_lookup(raw_text)
+    normalized_match = _normalize_item_number_for_lookup(match_text)
+    if normalized_raw and normalized_raw == normalized_match:
+        return 97, "normalized_exact"
+    compare_left = normalized_raw or raw_text.casefold()
+    compare_right = normalized_match or match_text.casefold()
+    score = int(round(SequenceMatcher(None, compare_left, compare_right).ratio() * 100))
+    if compare_left in compare_right or compare_right in compare_left:
+        score = max(score, 88)
+    if compare_left.startswith(compare_right) or compare_right.startswith(compare_left):
+        score = max(score, 90)
+    return score, "fuzzy"
+
+
+def _classify_ranked_preview_status(
+    *,
+    confidence_score: int | None,
+    match_reason: str | None,
+) -> str:
+    if confidence_score is None:
+        return "unresolved"
+    reason = str(match_reason or "")
+    if reason.endswith("exact") or reason.endswith("casefold_exact") or reason.endswith("normalized_exact"):
+        return "exact"
+    if confidence_score >= ORDER_IMPORT_AUTO_ACCEPT_SCORE:
+        return "high_confidence"
+    if confidence_score >= ORDER_IMPORT_REVIEW_SCORE:
+        return "needs_review"
+    return "unresolved"
+
+
+PREVIEW_STATUS_PRIORITY = {
+    "exact": 0,
+    "high_confidence": 1,
+    "needs_review": 2,
+    "unresolved": 3,
+}
+
+
+def _merge_preview_statuses(*statuses: str) -> str:
+    return max(
+        (str(status or "unresolved") for status in statuses),
+        key=lambda value: PREVIEW_STATUS_PRIORITY.get(value, PREVIEW_STATUS_PRIORITY["unresolved"]),
+    )
+
+
+def _exact_preview_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    exact_candidates: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if (
+            _classify_ranked_preview_status(
+                confidence_score=int(candidate.get("confidence_score") or 0),
+                match_reason=str(candidate.get("match_reason") or ""),
+            )
+            == "exact"
+        ):
+            exact_candidates.append(candidate)
+    return exact_candidates
+
+
+def _classify_order_import_preview_status(
+    *,
+    confidence_score: int | None,
+    match_reason: str | None,
+) -> str:
+    return _classify_ranked_preview_status(
+        confidence_score=confidence_score,
+        match_reason=match_reason,
+    )
+
+
+def preview_orders_import_from_rows(
+    conn: sqlite3.Connection,
+    *,
+    supplier_id: int | None = None,
+    supplier_name: str | None = None,
+    rows: list[dict[str, str]],
+    default_order_date: str | None = None,
+    source_name: str = "order_import.csv",
+) -> dict[str, Any]:
+    supplier_context = _resolve_order_import_supplier_context(
+        conn,
+        supplier_id=supplier_id,
+        supplier_name=supplier_name,
+    )
+    supplier_name_value = str(supplier_context["supplier_name"])
+    preview_candidates = _load_order_import_preview_candidates(
+        conn,
+        supplier_context["supplier_id"],
+    )
+    normalized_default_date = normalize_optional_date(default_order_date, "default_order_date")
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+
+    for row_number, row in enumerate(rows, start=2):
+        if not any(str(value or "").strip() for value in row.values()):
+            continue
+
+        item_number = require_non_empty(str(row.get("item_number", "")), f"item_number (row {row_number})")
+        quantity_raw = row.get("quantity")
+        try:
+            ordered_quantity = require_positive_int(int(quantity_raw), f"quantity (row {row_number})")
+        except Exception as exc:  # noqa: BLE001
+            raise AppError(
+                code="INVALID_CSV",
+                message=f"quantity must be an integer > 0 (row {row_number})",
+                status_code=422,
+            ) from exc
+
+        normalized_pdf_link = _normalize_manual_pdf_link(
+            row.get("pdf_link"),
+            supplier_name=supplier_name_value,
+            row_index=row_number,
+        )
+        order_date = normalize_optional_date(row.get("order_date"), f"order_date (row {row_number})")
+        if order_date is None:
+            order_date = normalized_default_date or today_jst()
+        expected_arrival = normalize_optional_date(
+            row.get("expected_arrival"),
+            f"expected_arrival (row {row_number})",
+        )
+        issue_date = normalize_optional_date(row.get("issue_date"), f"issue_date (row {row_number})")
+        quotation_number = require_non_empty(
+            str(row.get("quotation_number", "")),
+            f"quotation_number (row {row_number})",
+        )
+
+        top_candidates = _rank_order_style_preview_candidates(item_number, preview_candidates)
+        best_candidate = top_candidates[0] if top_candidates else None
+        status = _classify_order_import_preview_status(
+            confidence_score=int(best_candidate["confidence_score"]) if best_candidate else None,
+            match_reason=str(best_candidate["match_reason"]) if best_candidate else None,
+        )
+        suggested_match = best_candidate if status != "unresolved" else None
+        preview_row = {
+            "row": row_number,
+            "supplier_name": supplier_name_value,
+            "item_number": item_number,
+            "quantity": ordered_quantity,
+            "quotation_number": quotation_number,
+            "issue_date": issue_date,
+            "order_date": order_date,
+            "expected_arrival": expected_arrival,
+            "pdf_link": normalized_pdf_link,
+            "status": status,
+            "confidence_score": int(best_candidate["confidence_score"]) if best_candidate else None,
+            "suggested_match": suggested_match,
+            "candidates": top_candidates,
+            "warnings": [],
+            "order_amount": (
+                ordered_quantity * int(suggested_match["units_per_order"])
+                if suggested_match is not None
+                else None
+            ),
+        }
+        preview_rows.append(preview_row)
+        summary["total_rows"] += 1
+        summary[status] += 1
+
+    blocking_errors: list[str] = []
+    duplicate_quotation_numbers: list[str] = []
+    if supplier_context["supplier_id"] is not None:
+        duplicate_quotation_numbers = _order_import_duplicate_quotation_numbers(
+            conn,
+            int(supplier_context["supplier_id"]),
+            [str(row["quotation_number"]) for row in preview_rows],
+        )
+        if duplicate_quotation_numbers:
+            duplicate_set = set(duplicate_quotation_numbers)
+            blocking_errors.append(
+                "Quotation already imported for this supplier: "
+                + ", ".join(duplicate_quotation_numbers)
+            )
+            for preview_row in preview_rows:
+                if str(preview_row["quotation_number"]) in duplicate_set:
+                    preview_row["warnings"].append("Quotation already imported for this supplier.")
+
+    return {
+        "source_name": source_name,
+        "supplier": supplier_context,
+        "thresholds": {
+            "auto_accept": ORDER_IMPORT_AUTO_ACCEPT_SCORE,
+            "review": ORDER_IMPORT_REVIEW_SCORE,
+        },
+        "summary": summary,
+        "blocking_errors": blocking_errors,
+        "duplicate_quotation_numbers": duplicate_quotation_numbers,
+        "can_auto_accept": (
+            not blocking_errors
+            and summary["total_rows"] > 0
+            and summary["needs_review"] == 0
+            and summary["unresolved"] == 0
+        ),
+        "rows": preview_rows,
+    }
+
+
 def _process_order_rows_for_import(
     conn: sqlite3.Connection,
     *,
@@ -3151,6 +5373,7 @@ def _process_order_rows_for_import(
     rows: list[dict[str, str]],
     default_order_date: str | None = None,
     allow_noncanonical_pdf_link: bool = False,
+    row_overrides: dict[int, dict[str, int]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     resolved: list[dict[str, Any]] = []
     missing: list[dict[str, Any]] = []
@@ -3180,6 +5403,23 @@ def _process_order_rows_for_import(
             allow_noncanonical_path=allow_noncanonical_pdf_link,
         )
         item_id, units_per_order = _resolve_order_item(conn, supplier_id, item_number)
+        override = (row_overrides or {}).get(idx, {})
+        override_item_id = override.get("item_id")
+        override_units = override.get("units_per_order")
+        if override_item_id is not None:
+            _get_entity_or_404(
+                conn,
+                "items_master",
+                "item_id",
+                override_item_id,
+                "ITEM_NOT_FOUND",
+                f"Item with id {override_item_id} not found",
+            )
+            if item_id != override_item_id and override_units is None:
+                units_per_order = 1
+            item_id = override_item_id
+        if override_units is not None:
+            units_per_order = override_units
         if item_id is None:
             missing.append(
                 {
@@ -3231,14 +5471,19 @@ def import_orders_from_rows(
     source_name: str = "order_import.csv",
     missing_output_dir: str | Path | None = None,
     allow_noncanonical_pdf_link: bool = False,
+    row_overrides: dict[str | int, Any] | None = None,
+    alias_saves: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     sid = _resolve_supplier_id(conn, supplier_id, supplier_name)
+    normalized_overrides = _normalize_order_import_overrides(row_overrides)
+    normalized_alias_saves = _normalize_order_import_alias_saves(alias_saves)
     resolved, missing = _process_order_rows_for_import(
         conn,
         supplier_id=sid,
         rows=rows,
         default_order_date=default_order_date,
         allow_noncanonical_pdf_link=allow_noncanonical_pdf_link,
+        row_overrides=normalized_overrides,
     )
     if missing:
         missing_csv_path = _write_missing_items_csv(
@@ -3253,35 +5498,27 @@ def import_orders_from_rows(
             "rows": missing,
         }
 
-    quotation_numbers = sorted({str(row["quotation_number"]).strip() for row in resolved if str(row["quotation_number"]).strip()})
-    if quotation_numbers:
-        placeholders = ",".join("?" for _ in quotation_numbers)
-        duplicate_rows = conn.execute(
-            f"""
-            SELECT q.quotation_number
-            FROM quotations q
-            WHERE q.supplier_id = ?
-              AND q.quotation_number IN ({placeholders})
-              AND EXISTS (
-                SELECT 1
-                FROM orders o
-                WHERE o.quotation_id = q.quotation_id
-              )
-            ORDER BY q.quotation_number
-            """,
-            (sid, *quotation_numbers),
-        ).fetchall()
-        if duplicate_rows:
-            duplicated = [str(row["quotation_number"]) for row in duplicate_rows]
-            raise AppError(
-                code="DUPLICATE_QUOTATION_IMPORT",
-                message=(
-                    "Quotation already imported for this supplier: "
-                    f"{', '.join(duplicated)}"
-                ),
-                status_code=409,
-                details={"quotation_numbers": duplicated},
-            )
+    duplicated = _order_import_duplicate_quotation_numbers(
+        conn,
+        sid,
+        [str(row["quotation_number"]) for row in resolved],
+    )
+    if duplicated:
+        raise AppError(
+            code="DUPLICATE_QUOTATION_IMPORT",
+            message=(
+                "Quotation already imported for this supplier: "
+                f"{', '.join(duplicated)}"
+            ),
+            status_code=409,
+            details={"quotation_numbers": duplicated},
+        )
+
+    saved_alias_count = _apply_order_import_alias_saves(
+        conn,
+        supplier_id=sid,
+        alias_saves=normalized_alias_saves,
+    )
 
     order_ids: list[int] = []
     for row in resolved:
@@ -3316,7 +5553,12 @@ def import_orders_from_rows(
             ),
         )
         order_ids.append(int(cur.lastrowid))
-    return {"status": "ok", "imported_count": len(order_ids), "order_ids": order_ids}
+    return {
+        "status": "ok",
+        "imported_count": len(order_ids),
+        "order_ids": order_ids,
+        "saved_alias_count": saved_alias_count,
+    }
 
 
 def import_orders_from_content(
@@ -3328,6 +5570,8 @@ def import_orders_from_content(
     default_order_date: str | None = None,
     source_name: str = "order_import.csv",
     missing_output_dir: str | Path | None = None,
+    row_overrides: dict[str | int, Any] | None = None,
+    alias_saves: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     rows = _load_csv_rows_from_content(content)
     return import_orders_from_rows(
@@ -3338,6 +5582,28 @@ def import_orders_from_content(
         default_order_date=default_order_date,
         source_name=source_name,
         missing_output_dir=missing_output_dir,
+        row_overrides=row_overrides,
+        alias_saves=alias_saves,
+    )
+
+
+def preview_orders_import_from_content(
+    conn: sqlite3.Connection,
+    *,
+    supplier_id: int | None = None,
+    supplier_name: str | None = None,
+    content: bytes,
+    default_order_date: str | None = None,
+    source_name: str = "order_import.csv",
+) -> dict[str, Any]:
+    rows = _load_csv_rows_from_content(content)
+    return preview_orders_import_from_rows(
+        conn,
+        supplier_id=supplier_id,
+        supplier_name=supplier_name,
+        rows=rows,
+        default_order_date=default_order_date,
+        source_name=source_name,
     )
 
 
@@ -5120,6 +7386,109 @@ def update_project(conn: sqlite3.Connection, project_id: int, payload: dict[str,
     return get_project(conn, project_id)
 
 
+def preview_project_requirement_bulk_text(
+    conn: sqlite3.Connection,
+    *,
+    text: str,
+) -> dict[str, Any]:
+    item_catalog_rows = _load_item_preview_catalog_rows(conn)
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+
+    for line_number, raw_line in enumerate(str(text or "").splitlines(), start=1):
+        stripped_line = raw_line.strip()
+        if not stripped_line:
+            continue
+
+        parts = [part.strip() for part in stripped_line.split(",")]
+        raw_target = parts[0] if parts else ""
+        quantity_raw = parts[1] if len(parts) > 1 else "1"
+        quantity = 1
+        quantity_defaulted = False
+        try:
+            quantity = require_positive_int(int(quantity_raw or "1"), f"quantity (line {line_number})")
+        except Exception:  # noqa: BLE001
+            quantity = 1
+            quantity_defaulted = True
+
+        candidate_matches = _rank_item_preview_candidates(item_catalog_rows, raw_target)
+        exact_candidates = [
+            candidate
+            for candidate in candidate_matches
+            if _classify_ranked_preview_status(
+                confidence_score=int(candidate.get("confidence_score") or 0),
+                match_reason=str(candidate.get("match_reason") or ""),
+            )
+            == "exact"
+        ]
+        suggested_match = exact_candidates[0] if len(exact_candidates) == 1 else candidate_matches[0] if candidate_matches else None
+        status = "unresolved"
+        message = "No registered item matched this line."
+        requires_user_selection = True
+
+        if raw_target:
+            if len(exact_candidates) == 1:
+                status = "exact"
+                message = "Matched registered item."
+                requires_user_selection = False
+            elif len(exact_candidates) > 1:
+                status = "needs_review"
+                suggested_match = None
+                message = "Multiple registered items share this item number. Choose the correct item."
+                candidate_matches = exact_candidates
+            elif suggested_match is not None:
+                status = _classify_ranked_preview_status(
+                    confidence_score=int(suggested_match.get("confidence_score") or 0),
+                    match_reason=str(suggested_match.get("match_reason") or ""),
+                )
+                if status == "high_confidence":
+                    message = "High-confidence match found."
+                    requires_user_selection = False
+                elif status == "needs_review":
+                    message = "Review the suggested item before applying."
+                else:
+                    message = "No reliable item match found. Choose the correct item."
+            else:
+                message = "No registered item matched this line."
+        else:
+            message = "item_number is required"
+
+        if quantity_defaulted:
+            if status in {"exact", "high_confidence"}:
+                status = "needs_review"
+            message = f"{message} Quantity was invalid and defaulted to 1."
+
+        preview_row = {
+            "row": line_number,
+            "raw_line": stripped_line,
+            "raw_target": raw_target,
+            "quantity": str(quantity),
+            "quantity_raw": quantity_raw,
+            "quantity_defaulted": quantity_defaulted,
+            "status": status,
+            "message": message,
+            "requires_user_selection": requires_user_selection,
+            "allowed_entity_types": ["item"] if status != "exact" else [],
+            "suggested_match": suggested_match,
+            "candidates": candidate_matches,
+        }
+        preview_rows.append(preview_row)
+        summary[status] += 1
+        summary["total_rows"] += 1
+
+    return {
+        "summary": summary,
+        "can_auto_accept": summary["total_rows"] > 0 and summary["needs_review"] == 0 and summary["unresolved"] == 0,
+        "rows": preview_rows,
+    }
+
+
 def delete_project(conn: sqlite3.Connection, project_id: int) -> None:
     _get_entity_or_404(
         conn,
@@ -6033,6 +8402,131 @@ def update_rfq_line(
     }
 
 
+def preview_bom_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    target_date: str | None = None,
+) -> dict[str, Any]:
+    normalized_target_date = _normalize_future_target_date(
+        target_date,
+        field_name="target_date",
+    )
+    supplier_rows = _load_supplier_preview_catalog_rows(conn)
+    preview_candidate_cache: dict[int | None, list[dict[str, Any]]] = {}
+    preview_rows: list[dict[str, Any]] = []
+    summary = {
+        "total_rows": 0,
+        "exact": 0,
+        "high_confidence": 0,
+        "needs_review": 0,
+        "unresolved": 0,
+    }
+
+    for row_number, row in enumerate(rows, start=1):
+        supplier_name = str(row.get("supplier") or "").strip()
+        item_number = str(row.get("item_number") or "").strip()
+        required_quantity = int(row.get("required_quantity") or 0)
+        if required_quantity < 0:
+            raise AppError(
+                code="INVALID_QUANTITY",
+                message="required_quantity must be >= 0",
+                status_code=422,
+            )
+
+        supplier_resolution = _resolve_bom_preview_supplier(supplier_rows, supplier_name)
+        preview_supplier_id = supplier_resolution["preview_supplier_id"]
+        if preview_supplier_id not in preview_candidate_cache:
+            preview_candidate_cache[preview_supplier_id] = _load_order_import_preview_candidates(
+                conn,
+                preview_supplier_id,
+            )
+        item_resolution = _resolve_bom_preview_item(
+            item_number,
+            preview_candidate_cache[preview_supplier_id],
+        )
+        status = _merge_preview_statuses(
+            str(supplier_resolution["status"]),
+            str(item_resolution["status"]),
+        )
+
+        canonical_item_number: str | None = None
+        units_per_order: int | None = None
+        canonical_required_quantity: int | None = None
+        available_stock: int | None = None
+        shortage: int | None = None
+        suggested_match = item_resolution["suggested_match"]
+        if suggested_match is not None and str(item_resolution["status"]) in {"exact", "high_confidence"}:
+            units_per_order = int(suggested_match.get("units_per_order") or 1)
+            canonical_item_number = str(
+                suggested_match.get("canonical_item_number") or suggested_match["value_text"]
+            )
+            canonical_required_quantity = required_quantity * units_per_order
+            available_stock = _get_projected_available_inventory(
+                conn,
+                int(suggested_match["entity_id"]),
+                target_date=normalized_target_date,
+            )
+            shortage = max(0, canonical_required_quantity - available_stock)
+
+        message_parts: list[str] = []
+        if status == "exact":
+            if str((suggested_match or {}).get("match_source") or "") == "supplier_item_alias":
+                message_parts.append("Matched supplier alias to a canonical item.")
+            else:
+                message_parts.append("Matched registered supplier and item.")
+        elif status == "high_confidence":
+            message_parts.append("High-confidence BOM row match found.")
+        else:
+            for resolution in (supplier_resolution, item_resolution):
+                resolution_status = str(resolution["status"])
+                if resolution_status in {"needs_review", "unresolved"}:
+                    message_parts.append(str(resolution["message"]))
+            if not message_parts:
+                for resolution in (supplier_resolution, item_resolution):
+                    resolution_status = str(resolution["status"])
+                    if resolution_status == "high_confidence":
+                        message_parts.append(str(resolution["message"]))
+        if not message_parts:
+            message_parts.append("Review this row before continuing.")
+
+        preview_row = {
+            "row": row_number,
+            "supplier": supplier_name,
+            "item_number": item_number,
+            "required_quantity": required_quantity,
+            "supplier_status": supplier_resolution["status"],
+            "item_status": item_resolution["status"],
+            "status": status,
+            "message": " ".join(dict.fromkeys(message_parts)),
+            "requires_supplier_selection": supplier_resolution["requires_selection"],
+            "requires_item_selection": item_resolution["requires_selection"],
+            "suggested_supplier": supplier_resolution["suggested_match"],
+            "supplier_candidates": supplier_resolution["candidates"],
+            "suggested_match": suggested_match,
+            "candidates": item_resolution["candidates"],
+            "canonical_item_number": canonical_item_number,
+            "units_per_order": units_per_order,
+            "canonical_required_quantity": canonical_required_quantity,
+            "available_stock": available_stock,
+            "shortage": shortage,
+        }
+        preview_rows.append(preview_row)
+        summary["total_rows"] += 1
+        summary[status] += 1
+
+    return {
+        "target_date": normalized_target_date,
+        "summary": summary,
+        "can_auto_accept": (
+            summary["total_rows"] > 0
+            and summary["needs_review"] == 0
+            and summary["unresolved"] == 0
+        ),
+        "rows": preview_rows,
+    }
+
+
 def analyze_bom_rows(
     conn: sqlite3.Connection,
     rows: list[dict[str, Any]],
@@ -6046,7 +8540,10 @@ def analyze_bom_rows(
     results: list[dict[str, Any]] = []
     for row in rows:
         supplier_name = require_non_empty(row["supplier"], "supplier")
-        supplier_id = _get_or_create_supplier(conn, supplier_name)
+        supplier_context = _resolve_order_import_supplier_context(
+            conn,
+            supplier_name=supplier_name,
+        )
         item_number = require_non_empty(row["item_number"], "item_number")
         required_quantity = int(row["required_quantity"])
         if required_quantity < 0:
@@ -6055,7 +8552,7 @@ def analyze_bom_rows(
                 message="required_quantity must be >= 0",
                 status_code=422,
             )
-        item_id, units = _resolve_order_item(conn, supplier_id, item_number)
+        item_id, units = _resolve_order_item(conn, supplier_context["supplier_id"], item_number)
         if item_id is None:
             results.append(
                 {
@@ -6888,6 +9385,262 @@ def create_manufacturer(conn: sqlite3.Connection, name: str) -> dict[str, Any]:
 def list_suppliers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT supplier_id, name FROM suppliers ORDER BY name").fetchall()
     return _rows_to_dict(rows)
+
+
+CATALOG_ENTITY_TYPES = {"item", "assembly", "supplier", "project"}
+
+
+def _catalog_rank_text(query: str, *values: Any) -> tuple[int, str | None]:
+    normalized_query = query.casefold()
+    best_rank = 999
+    best_source: str | None = None
+    for idx, value in enumerate(values):
+        if value is None:
+            continue
+        normalized_value = str(value).strip().casefold()
+        if not normalized_value:
+            continue
+        if normalized_value == normalized_query:
+            rank = 0
+        elif normalized_value.startswith(normalized_query):
+            rank = 1
+        elif normalized_query in normalized_value:
+            rank = 2
+        else:
+            continue
+        if rank < best_rank:
+            best_rank = rank
+            best_source = str(idx)
+    return best_rank, best_source
+
+
+def catalog_search(
+    conn: sqlite3.Connection,
+    *,
+    q: str,
+    entity_types: list[str] | None = None,
+    limit_per_type: int = 8,
+) -> dict[str, Any]:
+    normalized_query = str(q or "").strip()
+    if not normalized_query:
+        return {"query": "", "results": []}
+
+    requested_types = entity_types or sorted(CATALOG_ENTITY_TYPES)
+    invalid_types = [entity_type for entity_type in requested_types if entity_type not in CATALOG_ENTITY_TYPES]
+    if invalid_types:
+        raise AppError(
+            code="INVALID_CATALOG_TYPE",
+            message=f"Unsupported catalog type(s): {', '.join(sorted(set(invalid_types)))}",
+            status_code=422,
+        )
+
+    wildcard = f"%{normalized_query}%"
+    results: list[dict[str, Any]] = []
+
+    if "item" in requested_types:
+        item_rows = conn.execute(
+            """
+            SELECT
+                im.item_id,
+                im.item_number,
+                m.name AS manufacturer_name,
+                COALESCE(ca.canonical_category, im.category) AS category,
+                im.description,
+                s.name AS alias_supplier_name,
+                a.ordered_item_number
+            FROM items_master im
+            JOIN manufacturers m ON m.manufacturer_id = im.manufacturer_id
+            LEFT JOIN category_aliases ca ON ca.alias_category = im.category
+            LEFT JOIN supplier_item_aliases a ON a.canonical_item_id = im.item_id
+            LEFT JOIN suppliers s ON s.supplier_id = a.supplier_id
+            WHERE
+                im.item_number LIKE ?
+                OR m.name LIKE ?
+                OR COALESCE(ca.canonical_category, im.category, '') LIKE ?
+                OR COALESCE(im.description, '') LIKE ?
+                OR COALESCE(a.ordered_item_number, '') LIKE ?
+                OR COALESCE(s.name, '') LIKE ?
+            ORDER BY im.item_number, im.item_id
+            """,
+            (wildcard, wildcard, wildcard, wildcard, wildcard, wildcard),
+        ).fetchall()
+        item_candidates: dict[int, dict[str, Any]] = {}
+        for row in item_rows:
+            score, source_idx = _catalog_rank_text(
+                normalized_query,
+                row["item_number"],
+                row["manufacturer_name"],
+                row["category"],
+                row["description"],
+                row["ordered_item_number"],
+                row["alias_supplier_name"],
+            )
+            if score == 999:
+                continue
+            source_map = {
+                "0": "item_number",
+                "1": "manufacturer_name",
+                "2": "category",
+                "3": "description",
+                "4": "supplier_item_alias",
+                "5": "alias_supplier_name",
+            }
+            match_source = source_map.get(source_idx or "", "item_number")
+            summary_bits = [str(row["manufacturer_name"])]
+            if row["category"]:
+                summary_bits.append(str(row["category"]))
+            summary_bits.append(f"#{int(row['item_id'])}")
+            if match_source == "supplier_item_alias" and row["ordered_item_number"]:
+                summary_bits.append(
+                    f"alias {row['ordered_item_number']} @ {row['alias_supplier_name'] or 'supplier'}"
+                )
+            candidate = {
+                "entity_type": "item",
+                "entity_id": int(row["item_id"]),
+                "value_text": str(row["item_number"]),
+                "display_label": f"{row['item_number']} ({row['manufacturer_name']}) #{int(row['item_id'])}",
+                "summary": " | ".join(summary_bits),
+                "match_source": match_source,
+                "_score": score,
+            }
+            existing = item_candidates.get(int(row["item_id"]))
+            if existing is None or (candidate["_score"], candidate["display_label"]) < (
+                existing["_score"],
+                existing["display_label"],
+            ):
+                item_candidates[int(row["item_id"])] = candidate
+        results.extend(
+            sorted(item_candidates.values(), key=lambda row: (int(row["_score"]), str(row["display_label"]).casefold()))[
+                :limit_per_type
+            ]
+        )
+
+    if "assembly" in requested_types:
+        assembly_rows = conn.execute(
+            """
+            SELECT
+                a.assembly_id,
+                a.name,
+                a.description,
+                COUNT(ac.item_id) AS component_count
+            FROM assemblies a
+            LEFT JOIN assembly_components ac ON ac.assembly_id = a.assembly_id
+            WHERE a.name LIKE ? OR COALESCE(a.description, '') LIKE ?
+            GROUP BY a.assembly_id
+            ORDER BY a.name, a.assembly_id
+            """,
+            (wildcard, wildcard),
+        ).fetchall()
+        assembly_results: list[dict[str, Any]] = []
+        for row in assembly_rows:
+            score, source_idx = _catalog_rank_text(normalized_query, row["name"], row["description"])
+            if score == 999:
+                continue
+            match_source = "name" if source_idx == "0" else "description"
+            summary = f"{int(row['component_count'])} component(s) | #{int(row['assembly_id'])}"
+            if row["description"]:
+                summary = f"{summary} | {row['description']}"
+            assembly_results.append(
+                {
+                    "entity_type": "assembly",
+                    "entity_id": int(row["assembly_id"]),
+                    "value_text": str(row["name"]),
+                    "display_label": f"{row['name']} #{int(row['assembly_id'])}",
+                    "summary": summary,
+                    "match_source": match_source,
+                    "_score": score,
+                }
+            )
+        results.extend(
+            sorted(assembly_results, key=lambda row: (int(row["_score"]), str(row["display_label"]).casefold()))[
+                :limit_per_type
+            ]
+        )
+
+    if "supplier" in requested_types:
+        supplier_rows = conn.execute(
+            """
+            SELECT
+                s.supplier_id,
+                s.name,
+                COUNT(a.alias_id) AS alias_count
+            FROM suppliers s
+            LEFT JOIN supplier_item_aliases a ON a.supplier_id = s.supplier_id
+            WHERE s.name LIKE ?
+            GROUP BY s.supplier_id
+            ORDER BY s.name, s.supplier_id
+            """,
+            (wildcard,),
+        ).fetchall()
+        supplier_results: list[dict[str, Any]] = []
+        for row in supplier_rows:
+            score, _ = _catalog_rank_text(normalized_query, row["name"])
+            if score == 999:
+                continue
+            supplier_results.append(
+                {
+                    "entity_type": "supplier",
+                    "entity_id": int(row["supplier_id"]),
+                    "value_text": str(row["name"]),
+                    "display_label": str(row["name"]),
+                    "summary": f"{int(row['alias_count'])} alias mapping(s) | #{int(row['supplier_id'])}",
+                    "match_source": "name",
+                    "_score": score,
+                }
+            )
+        results.extend(
+            sorted(supplier_results, key=lambda row: (int(row["_score"]), str(row["display_label"]).casefold()))[
+                :limit_per_type
+            ]
+        )
+
+    if "project" in requested_types:
+        project_rows = conn.execute(
+            """
+            SELECT
+                p.project_id,
+                p.name,
+                p.description,
+                p.status,
+                p.planned_start,
+                COUNT(pr.requirement_id) AS requirement_count
+            FROM projects p
+            LEFT JOIN project_requirements pr ON pr.project_id = p.project_id
+            WHERE p.name LIKE ? OR COALESCE(p.description, '') LIKE ?
+            GROUP BY p.project_id
+            ORDER BY p.created_at DESC, p.project_id DESC
+            """,
+            (wildcard, wildcard),
+        ).fetchall()
+        project_results: list[dict[str, Any]] = []
+        for row in project_rows:
+            score, source_idx = _catalog_rank_text(normalized_query, row["name"], row["description"])
+            if score == 999:
+                continue
+            match_source = "name" if source_idx == "0" else "description"
+            summary_parts = [str(row["status"]), f"{int(row['requirement_count'])} requirement(s)"]
+            if row["planned_start"]:
+                summary_parts.append(f"start {row['planned_start']}")
+            project_results.append(
+                {
+                    "entity_type": "project",
+                    "entity_id": int(row["project_id"]),
+                    "value_text": str(row["name"]),
+                    "display_label": f"{row['name']} #{int(row['project_id'])}",
+                    "summary": " | ".join(summary_parts),
+                    "match_source": match_source,
+                    "_score": score,
+                }
+            )
+        results.extend(
+            sorted(project_results, key=lambda row: (int(row["_score"]), str(row["display_label"]).casefold()))[
+                :limit_per_type
+            ]
+        )
+
+    for row in results:
+        row.pop("_score", None)
+    return {"query": normalized_query, "results": results}
 
 
 def create_supplier(conn: sqlite3.Connection, name: str) -> dict[str, Any]:

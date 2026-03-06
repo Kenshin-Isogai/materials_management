@@ -106,3 +106,19 @@ export type MissingItemResolverRow = {
   canonical_item_number?: string;
   units_per_order?: string;
 };
+
+export type CatalogEntityType = "item" | "assembly" | "supplier" | "project";
+
+export type CatalogSearchResult = {
+  entity_type: CatalogEntityType;
+  entity_id: number;
+  value_text: string;
+  display_label: string;
+  summary: string | null;
+  match_source: string | null;
+};
+
+export type CatalogSearchResponse = {
+  query: string;
+  results: CatalogSearchResult[];
+};
