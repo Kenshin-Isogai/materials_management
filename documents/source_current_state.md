@@ -77,6 +77,8 @@ Last updated: 2026-03-06 (JST)
 
 - SPA navigation is implemented with React Router via `AppShell`.
 - Data fetching is SWR-based with typed API client wrappers.
+- Movements page now uses a single expanded `Movement Entry` table for both one-off and multi-row moves (the separate `Single Move` form was removed).
+- Adding a new row in `Movement Entry` now inherits the latest completed `from/to` locations so repeated transfers do not require retyping the same pair each time.
 - Reservations page supports partial release/consume via quantity prompt.
 - Reservations page now uses a single expanded `Reservation Entry` table for both one-off and multi-row reservation creation (the separate `Single Reservation` form was removed).
 - Reservations and Projects page headers now include guidance clarifying scope: Reservations is execution-time allocation, Projects is future-demand planning.
@@ -92,7 +94,8 @@ Last updated: 2026-03-06 (JST)
   - `POST /api/bom/preview` classifies supplier/item matches as `exact`, `high_confidence`, `needs_review`, or `unresolved`
   - preview rows return ranked supplier/item candidates and projected canonical quantity / available stock / shortage
   - BOM analyze, reserve, and shortage-save actions now run from the corrected preview set instead of directly from the raw grid
-- Sticky table headers are globally enabled for browse tables, with `no-sticky-header` opt-outs applied on write-heavy multi-row entry grids (Bulk Item Entry, Bulk Move Entry, Reservation Entry, Assembly components, and BOM spreadsheet entry) to prevent header/field overlap while editing.
+- Sticky table headers are globally enabled for browse tables, with `no-sticky-header` opt-outs applied on write-heavy multi-row entry grids (Bulk Item Entry, Movement Entry, Reservation Entry, Assembly components, and BOM spreadsheet entry) to prevent header/field overlap while editing.
+- Movements `Movement Entry` rows now use `CatalogPicker` for item selection instead of a long static `<select>`.
 - Reservations `Reservation Entry` rows now use `CatalogPicker` for item selection instead of a long static `<select>`.
 - Items manual CSV import is now preview-first:
   - `POST /api/items/import-preview` classifies duplicate item rows, alias create/update rows, and unresolved canonical alias rows before commit
