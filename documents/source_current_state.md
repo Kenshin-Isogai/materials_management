@@ -1,6 +1,6 @@
 # Source Current State
 
-Last updated: 2026-03-07 (JST)
+Last updated: 2026-03-08 (JST)
 
 ## 1. System Snapshot
 
@@ -76,12 +76,13 @@ Last updated: 2026-03-07 (JST)
 
 ## 4. Frontend State
 
-- SPA navigation is implemented with React Router via `AppShell`.
+- SPA navigation now boots through a React Router data router (`createBrowserRouter` + `RouterProvider`) with `AppShell` as the shared layout route.
 - Data fetching is SWR-based with typed API client wrappers.
 - Added `/workspace` as the summary-first future-demand route.
   - default view: project summary dashboard with committed-vs-draft semantics
   - pipeline view: committed projects with `generic_committed_total` and `cumulative_generic_consumed_before_total`
   - board view: selected-project timeline plus shortage grid with `supply_sources_by_start` and `recovery_sources_after_start`
+  - route-leave blockers on the workspace page now run inside the supported data-router context, preventing the page-entry blank-screen crash caused by `unstable_usePrompt` under plain `BrowserRouter`
   - right-side drawer uses local breadcrumb navigation for project, item, and RFQ context while keeping the board visible
   - project drawer now uses the same editor logic as `/projects`, including bulk requirement preview/apply
   - item drawer now shows incoming orders plus cross-project item planning allocation context from `/api/items/{item_id}/planning-context`
@@ -225,8 +226,8 @@ Last updated: 2026-03-07 (JST)
 ## 6. Quality State
 
 - Backend tests: `122 passed` (latest run on 2026-03-06).
-- Frontend tests: `3 passed` via `npm run test` (latest run on 2026-03-06).
-- Frontend production build: success (latest run on 2026-03-06).
+- Frontend tests: `15 passed` via `npm run test` (latest run on 2026-03-08).
+- Frontend production build: success (latest run on 2026-03-08).
 
 ## 7. Known Directional Gaps (intentional for current phase)
 

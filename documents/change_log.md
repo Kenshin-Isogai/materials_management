@@ -1,3 +1,20 @@
+## 2026-03-08
+
+### Fixed
+
+- Migrated the frontend bootstrap from plain `BrowserRouter` to a React Router data router (`createBrowserRouter` + `RouterProvider`) while preserving the existing route tree under `AppShell`.
+- Restored the `/workspace` page so its unsaved-change prompt can use `unstable_usePrompt` without crashing on mount; opening the Workspace tab no longer produces a blank page from the router-context mismatch.
+
+### Docs
+
+- Updated `documents/technical_documentation.md` and `documents/source_current_state.md` with the data-router bootstrap and workspace blocker/runtime notes.
+
+### Tests
+
+- Added frontend regression coverage that mounts `/workspace` through a memory data router to verify the page renders without the previous blank-screen crash.
+- Frontend test suite executed: `npm run test` -> `8 passed` test files, `15 passed` tests.
+- Frontend production build executed: `npm run build`.
+
 ## 2026-03-07
 
 ### Changed
